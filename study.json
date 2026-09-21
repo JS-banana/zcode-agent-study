@@ -1,0 +1,2373 @@
+{
+  "version": 1,
+  "project": {
+    "name": "ZCode",
+    "revision": "872ad960de7ec172591f7e1952f7849229f94521（main 分支，提交 \"feat: open source\"，工作树干净）",
+    "scope": "静态走读了全部约 95 万行 TypeScript：apps/zcode-cli 子工作区（cli/core/bootstrap/adapters/contracts/tui/dynamic-workflow 等全部 16 个子包）与 packages/（desktop/web/server/services/ui/shared/rpc/client/provider/provider-node/zcode-server-cli 等）。核心链路（启动分流、回合主循环、工具管线、权限判定、压缩阈值、NDJSON/V4 协议、Agent 子进程拉起、桌面 Host、发行分流）由主笔者逐行复核并摘录原文；大型客户端包（ui/services/desktop）为主笔复核决定性位置、子代理扫读其余。未运行系统；OpenTUI、AI SDK 等预编译依赖的内部机制不可见，相关结论已标注推断。",
+    "language": "zh-CN",
+    "url": "https://github.com/JS-banana/ZCode"
+  },
+  "title": "ZCode 全景研读：一个 AI 编程工作台如何把 Electron、Web 与终端 Agent 装配成一体",
+  "summary": "ZCode 是 AI 编程工作台，同一仓库交付三种形态：Electron 桌面应用、浏览器工作台、终端 `zcode` 命令（无参数进 TUI，`--web` 起 Web）。三者背后是同一个 Agent 内核：宿主进程按 workspaceKey 惰性 spawn 一个 `zcode app-server --stdio` 子进程，`@zcode/core` 的 AgentRuntime 在 while(true) 回合循环里驱动模型流式响应与工具调用，一切 I/O 收敛到 `@zcode/adapters`，业务只依赖 `@zcode/contracts` 声明的端口。协议分两代并在 stdio 上并存：legacy 是 LF 分帧 NDJSON 的四类消息；V4 是 conversation 等 three 主题的 snapshot+delta 发布订阅，命令经 CommandInbox 按会话串行收口。客户端与宿主之间则用另一套 VS Code 风格的二进制 Channel RPC。安全边界靠权限模式判定 + 审批竞速 + alwaysAsk 前置，而不是内核沙箱（源码注释明言 sandbox 已撤除）；上下文安全靠两级压缩与明确的取消/超时条件而非轮数硬停止。本研读覆盖启动、主循环、工具、权限、压缩、记忆注入、持久化、子代理与双工作流、协议栈、桌面/Web 拓扑、模型链路、插件技能、命令执行、工程治理与前端渲染共 15 个机制。",
+  "terms": [
+    {
+      "id": "zcode-protocol",
+      "label": "ZCode Protocol",
+      "definition": "宿主/服务端与 Agent CLI 子进程之间跑在 stdio 上的 NDJSON 协议：Request/Notification/Response/Error 四类消息，zod schema 校验。"
+    },
+    {
+      "id": "v4",
+      "label": "ZCode Protocol V4",
+      "definition": "第二代协议：conversation/sessions-index/workspace-config 三个主题的 snapshot+delta 发布订阅，与 legacy 并存于同一条 stdio 管道。"
+    },
+    {
+      "id": "channel-rpc",
+      "label": "Channel RPC",
+      "definition": "客户端与 server/host 之间的 VS Code 风格 RPC：二进制分帧 + call/listen 两种原语 + ProxyChannel 把服务自动代理成方法调用。"
+    },
+    {
+      "id": "host",
+      "label": "窗口 Host",
+      "definition": "每个桌面窗口一个的 Electron UtilityProcess，承载全部业务服务与远程连接注册表；Renderer 与手机都 attachment 到它。"
+    },
+    {
+      "id": "turn",
+      "label": "回合（turn）",
+      "definition": "一次完整的模型回合：从输入准入排队开始，经过若干模型步（每次请求+工具批次），直到 TurnComplete 的执行单元，由 TurnMachine 状态机约束。"
+    },
+    {
+      "id": "steering",
+      "label": "Steering（插话）",
+      "definition": "回合 busy 时新输入不丢弃：排队进 runtime 命令队列，在下一轮模型请求前 drain 进上下文。"
+    },
+    {
+      "id": "compact",
+      "label": "Compact（压缩）",
+      "definition": "上下文压缩。microcompact 无模型调用、只清旧工具结果；全量 compact 用同一模型生成结构化摘要替换历史。"
+    },
+    {
+      "id": "artifact",
+      "label": "Artifact（工件）",
+      "definition": "超预算工具输出的落盘副本；模型只收到持久化路径与预览，避免大结果回灌上下文。"
+    },
+    {
+      "id": "dwf",
+      "label": "动态工作流（dwf）",
+      "definition": "dynamic workflow：用 TypeScript 脚本描述多代理编排，脚本在受控子进程沙箱运行，经 NDJSON 桥接调用宿主 WorkflowEngine 调度各 actor。"
+    },
+    {
+      "id": "port-adapter",
+      "label": "端口-适配器",
+      "definition": "contracts 包定义 *Port 接口，adapters 包提供唯一 Node 实现；core 业务只依赖端口，跨进程/跨实现可替换。"
+    },
+    {
+      "id": "builtin-plugin",
+      "label": "内置插件",
+      "definition": "随应用分发的官方插件：启动时播种进官方市场缓存；\"卸载\"只写抑制标记（suppressedBuiltins），不删缓存，可随时恢复。"
+    },
+    {
+      "id": "command-inbox",
+      "label": "CommandInbox",
+      "definition": "V4 网关的命令收口：同会话按 admission 顺序串行、幂等去重（512 条 LRU），重复命令共享同一终态。"
+    },
+    {
+      "id": "delivery-profile",
+      "label": "delivery profile",
+      "definition": "V4 帧推送节奏：desktop-continuous 30ms 连续流（含流式文本）；web-remote-replayable 150ms 可重放（仅文本行+工具进度）。"
+    },
+    {
+      "id": "mcs",
+      "label": "MCS",
+      "definition": "mid-conversation system：投影时允许被移到 system 侧的 system-reminder 来源集合。"
+    }
+  ],
+  "overview": {
+    "body": [
+      "ZCode 要解决的问题是一个 Agent 同时服务三种界面：桌面用户要原生窗口与系统能力，浏览器用户要零安装访问，终端用户要键盘优先的 TUI。仓库的答案是把\"界面\"与\"会话\"彻底分离：所有会话事实（消息、工具调用、权限、队列）都活在 Agent CLI 子进程与 SQLite 里，三种前端只是同一份会话流的不同投影。",
+      "读这张地图可以任选入口。终端线：`bin/zcode.mjs` 把无参数的调用交给 Agent CLI，CLI 的 `run.ts` 按命令名分发——无参数进 TUI，`-p` 走 headless，`app-server`/`agent-server` 变成协议服务器；`@zcode/bootstrap` 作为组合根装配配置、SQLite、插件、技能与 AgentRuntime。桌面线：Electron Main 用 `utilityProcess.fork` 给每个窗口拉起一个 [[host]]，Host 装配全部业务服务并经 MessagePort Channel RPC 暴露给 Renderer。Web 线：同一个 Hono 服务器静态托管前端产物，又在 `/ws` 上开 Channel RPC。",
+      "三条线最终汇到同一处：services 层的进程管理器按 workspaceKey 惰性 spawn `zcode app-server --stdio`，之后一切交互都走 stdio 上的 [[zcode-protocol]]（legacy）与 [[v4]]。Agent 子进程内部，`@zcode/core` 的回合主循环每轮先做压缩检查、初始化 MCP、组装工具面，再向模型发起流式请求；模型发出的工具调用经调度器并发执行，结果写回历史后进入下一轮，直到没有工具调用为止。",
+      "两条纪律贯穿全仓。第一是 [[port-adapter]]：core 从不 import Node 内建，外部副作用全部收敛在 adapters 的 19 个子适配器里，这让子代理、工作流 actor、cron 轮能复用同一套 runtime。第二是\"业务状态不落 UI\"：TUI 只保留 useState 镜像，Web/Desktop 的 V4 投影存储是只读的 snapshot+delta 应用器——权限审批、AskUserQuestion、计划确认都是协议层的 interaction 请求，客户端只做呈现。"
+    ],
+    "groups": [
+      {
+        "id": "g-client",
+        "title": "客户端薄壳",
+        "summary": "桌面与 Web 前端是同一套 React 应用（@zcode/ui）的薄宿主，只负责传输与平台桥，不持有业务状态。"
+      },
+      {
+        "id": "g-host",
+        "title": "服务与宿主进程",
+        "summary": "承载业务服务、RPC 通道与 Agent 子进程管理的常驻进程层：桌面窗口 Host、HTTP/WS 服务器、守护进程形态。"
+      },
+      {
+        "id": "g-agent",
+        "title": "Agent CLI 运行时",
+        "summary": "apps/zcode-cli 子工作区：从命令入口、组合根装配、AgentRuntime 回合循环到 I/O 适配器的完整内核。"
+      },
+      {
+        "id": "g-foundation",
+        "title": "协议与基座",
+        "summary": "跨进程共享的接缝：两代协议 schema、Channel RPC 框架、端口与工具契约、SQLite 持久化、模型 Provider 层。客户端 SDK 与工作流引擎等次要接入面在机制章节展开。"
+      }
+    ],
+    "nodes": [
+      {
+        "id": "entry-runner",
+        "title": "发行入口 bin/zcode.mjs",
+        "caption": "--web 分流",
+        "group": "g-agent",
+        "summary": "发行包统一入口：`--web` 拉起 server/entry-http.js，其余调用把 argv[1] 指向 agent/zcode.cjs 并动态 import。",
+        "mechanism": "cli-startup",
+        "evidence": [
+          "ev-runner-web"
+        ],
+        "position": [
+          2,
+          0
+        ]
+      },
+      {
+        "id": "cli-entry",
+        "title": "@zcode/cli 命令层",
+        "caption": "参数解析与命令分发",
+        "group": "g-agent",
+        "summary": "main.ts 清洗进程环境并保护 stdout 通道；run.ts 解析全局参数并 switch 命令（TUI/headless/协议服务器/login/plugins 等）。",
+        "mechanism": "cli-startup",
+        "evidence": [
+          "ev-cli-main",
+          "ev-cli-run"
+        ],
+        "position": [
+          2,
+          1
+        ]
+      },
+      {
+        "id": "bootstrap",
+        "title": "@zcode/bootstrap 组合根",
+        "caption": "配置/存储/插件/技能装配",
+        "group": "g-agent",
+        "summary": "createApp 五层合并配置、打开 SQLite、发现插件/技能/子代理 profile，构造 AgentRuntime 并注入全部端口；同时实现 legacy+V4 协议服务器。",
+        "mechanism": "cli-startup",
+        "evidence": [
+          "ev-create-app",
+          "ev-runtime-tools"
+        ],
+        "position": [
+          2,
+          2
+        ]
+      },
+      {
+        "id": "core",
+        "title": "@zcode/core AgentRuntime",
+        "caption": "回合循环与工具编排",
+        "group": "g-agent",
+        "summary": "Agent 本体：回合状态机、while(true) 主循环、流式模型请求、工具调度与执行管线、压缩、记忆、子代理端口。方法以 prototype 装配进类。",
+        "mechanism": "agent-loop",
+        "evidence": [
+          "ev-turn-loop"
+        ],
+        "position": [
+          2,
+          3
+        ]
+      },
+      {
+        "id": "tui",
+        "title": "@zcode/tui 终端界面",
+        "caption": "OpenTUI 30fps 渲染",
+        "group": "g-client",
+        "summary": "React 19 + OpenTUI 自定义渲染器的 TUI；业务状态全在 core，TUI 只保留 useState 镜像与临时交互态。",
+        "mechanism": "ui-render",
+        "evidence": [
+          "ev-tui-renderer"
+        ],
+        "position": [
+          0,
+          0
+        ]
+      },
+      {
+        "id": "contracts",
+        "title": "@zcode/contracts 契约",
+        "caption": "端口与工具 schema",
+        "group": "g-foundation",
+        "summary": "29 个 *Port 端口接口、每个工具一份 zod+JSON schema、SessionEvent 事件类型、配置键常量——core 与 adapters 之间的全部接缝。",
+        "evidence": [],
+        "position": [
+          0,
+          6
+        ]
+      },
+      {
+        "id": "adapters",
+        "title": "@zcode/adapters 适配器",
+        "caption": "Node I/O 实现",
+        "group": "g-agent",
+        "summary": "19 个子适配器：exec/fs/http/mcp/skills/plugins/storage/model（Vercel AI SDK）/browser（CDP）等，是全仓唯一触碰 Node API 的 CLI 层。",
+        "mechanism": "bash-exec",
+        "evidence": [],
+        "position": [
+          2,
+          4
+        ]
+      },
+      {
+        "id": "shared-proto",
+        "title": "@zcode/shared 协议",
+        "caption": "legacy + V4 schema",
+        "group": "g-foundation",
+        "summary": "两代协议的 zod schema 单一来源：3717 行单文件的 legacy 协议，与只放 schema+纯函数的 zcode-protocol-v4 目录。",
+        "mechanism": "protocol",
+        "evidence": [
+          "ev-v4-discipline"
+        ],
+        "position": [
+          1,
+          5
+        ]
+      },
+      {
+        "id": "services",
+        "title": "@zcode/services 业务服务",
+        "caption": "30+ 服务与 Agent 进程管理",
+        "group": "g-host",
+        "summary": "ServiceDescriptor/channelName 组织的 30+ 业务服务域；ZCodeAgentProcessManager 按 workspaceKey 管理 Agent 子进程的生老病死。",
+        "mechanism": "desktop-web",
+        "evidence": [
+          "ev-spawn"
+        ],
+        "position": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "server",
+        "title": "@zcode/server HTTP/WS",
+        "caption": "Hono 单进程双职责",
+        "group": "g-host",
+        "summary": "静态托管 Web 前端 + /api + 三个 WS 端点（/ws、/ws/host、/ws/remote/:id）；同进程创建全部 services。",
+        "mechanism": "desktop-web",
+        "evidence": [
+          "ev-server-ws"
+        ],
+        "position": [
+          1,
+          2
+        ]
+      },
+      {
+        "id": "server-cli",
+        "title": "@zcode/zcode-server-cli",
+        "caption": "守护进程化 Server",
+        "group": "g-host",
+        "summary": "serve/status/stop/update 子命令：Supervisor（OS 服务/崩溃预算/control socket）+ Core（强制 loopback 的 HTTP/WS）。",
+        "mechanism": "desktop-web",
+        "evidence": [
+          "ev-server-cli"
+        ],
+        "position": [
+          1,
+          3
+        ]
+      },
+      {
+        "id": "rpc",
+        "title": "@zcode/rpc Channel RPC",
+        "caption": "二进制分帧 call/listen",
+        "group": "g-foundation",
+        "summary": "七层 IPC 框架：序列化、分帧传输、ChannelServer/Client（call/listen）、IPCServer 多播、ProxyChannel 自动代理、远程连接。",
+        "mechanism": "protocol",
+        "evidence": [
+          "ev-rpc-layers"
+        ],
+        "position": [
+          2,
+          5
+        ]
+      },
+      {
+        "id": "dt-main",
+        "title": "Electron Main",
+        "caption": "窗口与原生能力",
+        "group": "g-client",
+        "summary": "窗口生命周期、托盘、自动更新、深链、电源、内嵌浏览器 guest 管理；不承载业务状态，只编排 Host 子进程。",
+        "mechanism": "desktop-web",
+        "evidence": [],
+        "position": [
+          0,
+          4
+        ]
+      },
+      {
+        "id": "dt-host",
+        "title": "窗口 Host（UtilityProcess）",
+        "caption": "每窗口一个服务宿主",
+        "group": "g-host",
+        "summary": "Renderer 与手机都 attachment 到它：本地 services + 远程连接注册表；renderer reload 不杀 Host，保会话存活。",
+        "mechanism": "desktop-web",
+        "evidence": [
+          "ev-host-diagram"
+        ],
+        "position": [
+          1,
+          0
+        ]
+      },
+      {
+        "id": "dt-renderer",
+        "title": "Electron Renderer",
+        "caption": "薄启动壳",
+        "group": "g-client",
+        "summary": "仅 13 个文件：拿到 MessagePort 后 connectViaMessagePort，渲染 @zcode/ui 的同一个 <Root>。",
+        "mechanism": "ui-render",
+        "evidence": [],
+        "position": [
+          0,
+          3
+        ]
+      },
+      {
+        "id": "ui",
+        "title": "@zcode/ui 共享 React 应用",
+        "caption": "组件/hooks/Zustand",
+        "group": "g-client",
+        "summary": "全部业务 UI：shadcn 风格原语、业务组件、useServices/usePlatform hooks、Zustand store、V4 会话投影与交互弹窗、i18n。",
+        "mechanism": "ui-render",
+        "evidence": [
+          "ev-projection"
+        ],
+        "position": [
+          0,
+          2
+        ]
+      },
+      {
+        "id": "web",
+        "title": "@zcode/web Web 宿主",
+        "caption": "Vite + WebSocket",
+        "group": "g-client",
+        "summary": "Vite 应用：connectViaWebSocket 连 /ws（或 ?remote= 远程桥），以 Web 版 IPlatformService 渲染同一个 <Root>。",
+        "mechanism": "ui-render",
+        "evidence": [],
+        "position": [
+          0,
+          1
+        ]
+      },
+      {
+        "id": "storage",
+        "title": "SQLite 会话库与工件",
+        "caption": "事件溯源持久化",
+        "group": "g-foundation",
+        "summary": "默认 ~/.zcode/cli/db/db.sqlite：session/event/message part/项目权限规则/local_setting；超预算工具输出落为 artifact 文件。",
+        "mechanism": "session-state",
+        "evidence": [
+          "ev-sqlite-store"
+        ],
+        "position": [
+          0,
+          5
+        ]
+      },
+      {
+        "id": "provider",
+        "title": "Provider 层 + AI SDK",
+        "caption": "模型配置与请求",
+        "group": "g-foundation",
+        "summary": "provider 纯域包（三种 API 类型+zhipu 鉴权+模型目录）、provider-node 配置运行时，以及 adapters 里基于 Vercel AI SDK 的 AiSdkModelAdapter。",
+        "mechanism": "model-provider",
+        "evidence": [
+          "ev-model-provider",
+          "ev-provider-transport"
+        ],
+        "position": [
+          1,
+          6
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "from": "entry-runner",
+        "to": "server",
+        "label": "--web 时 spawn server/entry-http.js 并注入静态目录与鉴权令牌",
+        "role": "support",
+        "evidence": [
+          "ev-runner-web"
+        ]
+      },
+      {
+        "from": "entry-runner",
+        "to": "cli-entry",
+        "label": "其余调用把 argv[1] 指向 agent bundle 后动态 import",
+        "role": "primary",
+        "evidence": [
+          "ev-runner-web"
+        ],
+        "diagram_label": "进入 CLI 入口"
+      },
+      {
+        "from": "cli-entry",
+        "to": "tui",
+        "label": "无参数默认进 TUI，加载 @zcode/tui 渲染",
+        "role": "primary",
+        "evidence": [
+          "ev-cli-run"
+        ]
+      },
+      {
+        "from": "cli-entry",
+        "to": "bootstrap",
+        "label": "headless/协议模式经 bootstrap 创建 ZCodeApp 或协议服务器",
+        "role": "primary",
+        "evidence": [
+          "ev-cli-run"
+        ],
+        "diagram_label": "创建协议服务"
+      },
+      {
+        "from": "bootstrap",
+        "to": "core",
+        "label": "构造 AgentRuntime，注入端口并装配内置工具/钩子/执行器",
+        "role": "primary",
+        "evidence": [
+          "ev-runtime-tools"
+        ],
+        "diagram_label": "装配运行时"
+      },
+      {
+        "from": "tui",
+        "to": "bootstrap",
+        "label": "经注入回调（submitPrompt/事件订阅/权限应答）驱动会话",
+        "role": "support",
+        "evidence": []
+      },
+      {
+        "from": "core",
+        "to": "contracts",
+        "label": "依赖端口接口、工具 schema 与 SessionEvent 契约",
+        "role": "support",
+        "evidence": []
+      },
+      {
+        "from": "core",
+        "to": "adapters",
+        "label": "经端口调用 Node I/O（exec/fs/http/mcp/storage 等）",
+        "role": "primary",
+        "evidence": [],
+        "diagram_label": "调用适配器"
+      },
+      {
+        "from": "core",
+        "to": "provider",
+        "label": "model.streamText 经 AiSdkModelAdapter 与 AI SDK 发起请求",
+        "role": "primary",
+        "evidence": [
+          "ev-model-stream"
+        ]
+      },
+      {
+        "from": "core",
+        "to": "storage",
+        "label": "会话/事件/消息 part/权限规则持久化，工具输出落工件",
+        "role": "primary",
+        "evidence": [
+          "ev-sqlite-store"
+        ]
+      },
+      {
+        "from": "dt-main",
+        "to": "dt-host",
+        "label": "utilityProcess.fork 拉起每窗口 Host，转发 ServicePort",
+        "role": "primary",
+        "evidence": [
+          "ev-host-diagram"
+        ]
+      },
+      {
+        "from": "dt-renderer",
+        "to": "dt-host",
+        "label": "MessagePort RPC attachment（reload 只重挂端口）",
+        "role": "primary",
+        "evidence": [
+          "ev-host-diagram"
+        ]
+      },
+      {
+        "from": "dt-host",
+        "to": "services",
+        "label": "createLocalServices 装配全部本地服务",
+        "role": "primary",
+        "evidence": []
+      },
+      {
+        "from": "services",
+        "to": "cli-entry",
+        "label": "按 workspaceKey spawn zcode app-server --stdio（detached 进程组）",
+        "role": "primary",
+        "evidence": [
+          "ev-spawn"
+        ]
+      },
+      {
+        "from": "web",
+        "to": "server",
+        "label": "WebSocket /ws 建立 Channel RPC（web-remote-replayable）",
+        "role": "primary",
+        "evidence": [
+          "ev-server-ws"
+        ]
+      },
+      {
+        "from": "rpc",
+        "to": "services",
+        "label": "ProxyChannel.fromService 把服务暴露为 channel",
+        "role": "support",
+        "evidence": [
+          "ev-rpc-layers"
+        ]
+      },
+      {
+        "from": "server",
+        "to": "services",
+        "label": "同进程 ServiceCollection 托管，单进程双职责",
+        "role": "support",
+        "evidence": [
+          "ev-server-ws"
+        ]
+      },
+      {
+        "from": "server-cli",
+        "to": "server",
+        "label": "serve 子命令 fork server-core（强制 loopback）",
+        "role": "support",
+        "evidence": [
+          "ev-server-cli"
+        ]
+      },
+      {
+        "from": "web",
+        "to": "ui",
+        "label": "渲染共享 <Root>，注入 Web 平台桥",
+        "role": "support",
+        "evidence": []
+      },
+      {
+        "from": "dt-renderer",
+        "to": "ui",
+        "label": "渲染共享 <Root>，注入桌面平台桥",
+        "role": "support",
+        "evidence": []
+      },
+      {
+        "from": "bootstrap",
+        "to": "shared-proto",
+        "label": "协议服务器按 shared schema 校验 legacy+V4 消息",
+        "role": "support",
+        "evidence": [
+          "ev-v4-discipline"
+        ]
+      }
+    ],
+    "paths": [
+      {
+        "id": "web-msg",
+        "title": "Web 会话链路（静态走读）",
+        "summary": "从浏览器输入到 Agent 子进程再到持久化与协议回流的解释性边序，覆盖发起与装配，不含渲染回流；这是源码走读顺序，不是执行测量。",
+        "edges": [
+          14,
+          16,
+          13,
+          1,
+          3,
+          4,
+          8,
+          9,
+          20
+        ]
+      },
+      {
+        "id": "tui-msg",
+        "title": "终端 TUI 会话链路（静态走读）",
+        "summary": "发行入口到 CLI 分发、TUI 渲染与内核装配的解释性边序；TUI 与内核之间是注入回调而非进程边界。",
+        "edges": [
+          1,
+          2,
+          5,
+          3,
+          4,
+          7,
+          9
+        ]
+      },
+      {
+        "id": "desktop-attach",
+        "title": "桌面端装配",
+        "summary": "Electron Main 拉起窗口 Host、Renderer attachment、Host 装配服务并 spawn Agent 子进程的解释性边序。",
+        "edges": [
+          10,
+          11,
+          12,
+          13
+        ]
+      }
+    ],
+    "journey": [
+      {
+        "title": "在输入框发送一条消息",
+        "body": "Web/Desktop 前端把输入 dispatch 为 V4 sendText 命令信封；草稿首发先 createSession 拿 sessionId，命令 ACK accepted 即清空输入框，未确认前只显示乐观 overlay。",
+        "mechanism": "protocol"
+      },
+      {
+        "title": "命令经 Channel RPC 到达宿主",
+        "body": "命令在 /ws（或桌面 MessagePort）的 ChannelServer 上调用 zcodeAgentService；desktop-continuous 与 web-remote-replayable 客户端不能互相伪装。",
+        "mechanism": "protocol"
+      },
+      {
+        "title": "service 层找到或拉起 Agent 子进程",
+        "body": "进程管理器按 workspaceKey 复用或 spawn `zcode app-server --stdio`；POSIX 下 detached 进程组便于整树回收，stdio 三管道分别承载协议帧、stderr 与进程控制。",
+        "mechanism": "desktop-web",
+        "evidence": [
+          "ev-spawn"
+        ]
+      },
+      {
+        "title": "V4 网关串行收口命令",
+        "body": "ConversationV4Gateway 把 v4/command 交给 CommandInbox：同会话按 admission 顺序串行、幂等去重，随后交宿主 executor 执行。",
+        "mechanism": "protocol"
+      },
+      {
+        "title": "AgentRuntime 排队并开回合",
+        "body": "runtime 命令队列按 now/next/later 优先级准入；空闲开新 turn，busy 则 steering 排队。executeTurn 建模型、初始化上下文、跑 SessionStart/UserPromptSubmit 钩子后进入主循环。",
+        "mechanism": "agent-loop",
+        "evidence": [
+          "ev-turn-loop"
+        ]
+      },
+      {
+        "title": "流式响应与工具批次",
+        "body": "模型事件流（text_delta/tool_call…）经有序写队列持久化；流式期间只读工具可提前执行。流结束后工具调用按依赖分组并发执行（默认并发 10），结果按预算序列化回灌。",
+        "mechanism": "tool-pipeline"
+      },
+      {
+        "title": "事件回流成投影行",
+        "body": "会话事件写入 SQLite 并推给订阅者；V4 以 topic 帧按 delivery profile 节流推送 snapshot/delta，UI 投影存储应用后渲染为行模型时间线。",
+        "mechanism": "ui-render"
+      },
+      {
+        "title": "回合收尾与自治维护",
+        "body": "无工具调用即完成回合并调度后台记忆抽取；Edit/Write 成功后产生文件检查点供 rewind；上下文逼近阈值时下一轮请求前自动 compact。",
+        "mechanism": "context-compact"
+      }
+    ]
+  },
+  "mechanisms": [
+    {
+      "id": "cli-startup",
+      "nav_title": "启动与分流",
+      "title": "zcode 命令的三分流与组合根装配",
+      "question": "`zcode` 敲下后发生什么？同一个二进制如何变成 TUI、Web 服务和协议服务器三种形态？",
+      "answer": "分流发生在两层：发行包的 `bin/zcode.mjs`（runner.mjs）只区分 `--web`（拉起 HTTP 服务器进程）与其它（原样进入 Agent CLI）；Agent CLI 内部的 `run.ts` 再按命令名分发——无参数进 TUI、`-p/--target` 走 headless 单轮、`app-server`/`agent-server` 变成 stdio 协议服务器。所有形态最终都经过 bootstrap 的 `createApp` 组合根：五层合并配置、打开 SQLite、发现插件/技能/子代理，再构造注入了全部端口的 AgentRuntime。",
+      "steps": [
+        {
+          "id": "runner",
+          "title": "发行入口按 argv 分流",
+          "body": [
+            "发行包入口 `bin/zcode.mjs`（源码 scripts/zcode-distribution/runner.mjs）里 `--web` 分支解析 host/port/workspace/token 后 `serve()`——spawn `server/entry-http.js` 并注入 `ZCODE_AGENT_SERVER_COMMAND`、`ZCODE_WEB_STATIC_ROOT` 等环境；非 localhost 监听默认生成随机访问令牌。其余调用把 `process.argv[1]` 重写为 agent bundle 路径后动态 import，保留 TTY 与全部原始参数。"
+          ],
+          "output": "--web 得到托管 Web+Agent 的服务器进程；默认得到 Agent CLI 进程",
+          "evidence": [
+            "ev-runner-web"
+          ]
+        },
+        {
+          "id": "main-boundary",
+          "title": "main.ts 进程边界处理",
+          "body": [
+            "Agent CLI 的 main.ts 先清洗运行时环境变量，再判断本次调用是否协议模式（首参 `app-server`/`agent-server`）或 TUI 模式；这两种模式下整个 console 被重定向到 stderr——stdout 是严格协议帧通道（协议模式）或 TUI 专属（TUI 模式），绝不允许日志污染。"
+          ],
+          "evidence": [
+            "ev-cli-main"
+          ]
+        },
+        {
+          "id": "run-dispatch",
+          "title": "run.ts 命令分发",
+          "body": [
+            "`run()` 解析全局参数后分流：`-p/--prompt` 与 `--target` 进入 headless agent（target 包装成 /goal 命令）；switch 命令名处理 help/version/login/logout/doctor/plugins/skills/tui 等，`agent-server|app-server` 进入 bootstrap 的协议服务器；默认命令名即 `tui`——无参数就是 TUI。"
+          ],
+          "evidence": [
+            "ev-cli-run"
+          ]
+        },
+        {
+          "id": "create-app",
+          "title": "组合根装配一切",
+          "body": [
+            "bootstrap 的 createApp 按优先级合并配置（内置默认 → 用户 ~/.zcode/cli/config.json → 项目逐级 → 环境变量 → CLI 覆盖），打开 SQLite 会话库，扫描用户/项目/插件三处来源的子代理 profile、插件与技能根，然后把 executionPort/fileSystemPort/skillPort/mcpPort/modelFactory/permissionBroker 等端口一次性注入 AgentRuntime，并装配内置工具、HookRunner 与工具执行器。"
+          ],
+          "evidence": [
+            "ev-create-app",
+            "ev-runtime-tools"
+          ]
+        },
+        {
+          "id": "loading-order",
+          "title": "指令源的加载顺序",
+          "body": [
+            "启动期只做发现与装配；AGENTS.md 等用户指令是懒加载的——ContextBuilder 在构建回合上下文时才经 contextSourcePort 读取（用户级 ~/.zcode/AGENTS.md 优先，其次项目根，上限 100KB）。技能根顺序：config 显式 roots → 用户 ~/.zcode/skills 与 ~/.agents/skills → 项目各级 .zcode/skills 与 .agents/skills → 插件 skillRoots。"
+          ]
+        }
+      ],
+      "principle": [
+        "组合根集中装配、业务不摸 `process.env`：AGENTS.md 明文要求外部 I/O 全部收敛到 adapter，环境差异（桌面/远程、三个操作系统）靠依赖注入而非分支散落。",
+        "stdout 通道纪律让同一二进制可以被安全托管：协议模式下 stdout 只有协议帧，宿主才能放心按行解析。"
+      ],
+      "limits": [
+        "--web 分流在发行包 runner 而非 CLI 包内，源码态 `pnpm --filter @zcode/cli dev` 没有 Web 形态。",
+        "TUI 的加载在 SEA 发行态要先解压 zcode-tui-runtime，开发态直接 import，两条路径不同。"
+      ],
+      "evidence": [
+        "ev-runner-web",
+        "ev-cli-main",
+        "ev-cli-run",
+        "ev-create-app",
+        "ev-runtime-tools"
+      ]
+    },
+    {
+      "id": "agent-loop",
+      "nav_title": "回合主循环",
+      "title": "一个回合的生命周期：从准入到 TurnComplete",
+      "question": "一条用户消息如何变成模型回合？主循环靠什么条件停下来？",
+      "answer": "输入先经 admitPrompt 准入：空闲开新回合，busy 则作为 [[steering]] 插话或排队。executeTurn 编排一个回合：创建回合模型、初始化上下文、跑会话钩子、持久化用户消息，然后进入 while(true) 主循环——每轮 drain 插话、microcompact、autoCompact，初始化 MCP，组装工具面，重建 provider 消息后发起一次流式模型请求；模型再发工具调用就并发执行并回到循环，没有工具调用就跑 Stop 钩子后完成。主循环没有轮数硬停止：退出条件是模型自然结束、取消、权限拒绝、工具超时或不可恢复错误。",
+      "steps": [
+        {
+          "id": "admission",
+          "title": "命令队列准入",
+          "body": [
+            "runtime 命令队列的每条命令带 now/next/later 优先级与六种模式（prompt、target-continuation、task-notification、subagent-message 等）；admission 阶段建立的 turn 保留权在执行阶段复用，避免二次竞争。"
+          ],
+          "state": "AgentRuntime 持有命令队列与 active turn 状态",
+          "evidence": [
+            "ev-command-queue"
+          ]
+        },
+        {
+          "id": "orchestrate",
+          "title": "executeTurn 回合编排",
+          "body": [
+            "executeTurnCommand 依次：创建 turnModel → 初始化/重建 Context → SessionStart 钩子 → /compact、/rewind 命令分流 → beginActiveTurn → 确保会话已落库 → 发 TurnStarted 事件 → UserPromptSubmit 钩子 → 持久化用户消息。每个阶段都有 TTFT 埋点。"
+          ],
+          "evidence": [
+            "ev-turn-orchestrate"
+          ]
+        },
+        {
+          "id": "loop",
+          "title": "while(true) 主循环",
+          "body": [
+            "每轮循环开头 throwIfTurnAborted 守卫取消；模型步数大于 0 时先 drain 排队的运行时命令（后台子代理结果、工作流结果、插话），随后 microcompact 与 autoCompact（rapid-refill 熔断会直接抛错终止），再初始化 MCP、按 disallowlist 过滤工具面。"
+          ],
+          "branches": [
+            {
+              "condition": "abortSignal 已触发",
+              "effect": "抛 TurnCancelled，回合以 cancelled 结果收尾而非错误",
+              "target": "finish"
+            },
+            {
+              "condition": "连续 rapid-refill 超阈值",
+              "effect": "抛 compact 熔断错误终止回合",
+              "target": "finish"
+            }
+          ],
+          "evidence": [
+            "ev-turn-loop",
+            "ev-turn-compact-hook",
+            "ev-turn-preparation"
+          ]
+        },
+        {
+          "id": "model-step",
+          "title": "流式模型请求",
+          "body": [
+            "runModelTextRequest 做媒体/能力投影后调 `model.streamText`，for await 消费 start/text_start/text_delta/reasoning_*/tool_input_*/tool_call/finish/error 事件；每个 delta 经有序写队列（高水位 128 条背压）持久化为 ModelStreaming 事件。工具输入增量按行缓冲，遇换行或 4096 字符兜底 flush。"
+          ],
+          "evidence": [
+            "ev-model-stream"
+          ]
+        },
+        {
+          "id": "tools",
+          "title": "工具批次与回灌",
+          "body": [
+            "流结束后提取工具调用，交给调度器按依赖与只读/并发安全分组并发执行（默认并发 10）；每个结果写回消息历史、必要时产出文件检查点，然后 model step 返回 continue——主循环进入下一轮，把工具结果作为 provider 消息的一部分重新投影。"
+          ],
+          "branches": [
+            {
+              "condition": "本步有工具调用",
+              "effect": "返回 continue，回到循环开头",
+              "target": "loop"
+            }
+          ],
+          "evidence": [
+            "ev-tools-schedule"
+          ]
+        },
+        {
+          "id": "finish",
+          "title": "结束条件与收尾",
+          "body": [
+            "模型返回且无工具调用时进入 finishModelStepWithoutToolCalls：先尝试 inline guide 续跑一次，再给 Stop 钩子一次续跑机会，否则 turnMachine.complete 并 break。之后发 TurnComplete、turnNumber 自增、重建投影、调度项目记忆抽取。取消被归一为 TurnComplete(cancelled)，部分流快照仍会持久化。"
+          ],
+          "evidence": [
+            "ev-turn-stop"
+          ]
+        }
+      ],
+      "principle": [
+        "用明确条件承担安全边界：AGENTS.md 写明\"核心 agent loop 默认面向可持续运行的复杂任务设计，不用 tool call 次数做硬停止\"，资源约束由自动 compact、取消、权限拒绝、超时、输出截断、provider 重试上限分担。源码与之一致：AgentRuntimeConfig.maxTurns 只对子代理 runner 与记忆循环生效，主循环中未见强制点。",
+        "流式与持久化同构：每个流式 delta 都先落库再广播，因此崩溃/取消后的部分输出可恢复、可重放。"
+      ],
+      "limits": [
+        "断流恢复预算 STREAM_RECOVERY_MAX_RETRIES=10，超过则回合失败；恢复语义（以已提交工具结果为锚重放）未逐行验证。",
+        "本机制全部结论来自静态走读，未实际运行回合观察事件序列。"
+      ],
+      "evidence": [
+        "ev-command-queue",
+        "ev-turn-orchestrate",
+        "ev-turn-loop",
+        "ev-turn-compact-hook",
+        "ev-turn-preparation",
+        "ev-model-stream",
+        "ev-tools-schedule",
+        "ev-turn-stop"
+      ]
+    },
+    {
+      "id": "tool-pipeline",
+      "nav_title": "工具管线",
+      "title": "工具契约、调度与单次调用管线",
+      "question": "一次工具调用从模型输出到结果回灌要经过哪些关卡？",
+      "answer": "工具用三层结构定义：contracts 放 inputSchema/outputSchema、权限声明、结果预算与超时策略；core 的 ToolEntry 补 handler、元数据与输入归一化；bootstrap/core 按端口门控注册内置工具（40+ 个，MCP 工具运行时动态注册为 mcp__<server>__<tool>）。单次调用走固定管线：schema 校验 → 工具语义校验 → resolveInput 归一化 → PreToolUse 钩子 → 权限判定 → 带超时执行 → 输出校验 → 序列化（预算/工件）→ PostToolUse 钩子。",
+      "steps": [
+        {
+          "id": "contract",
+          "title": "三层契约与门控注册",
+          "body": [
+            "ToolPermissionSpec 声明 riskLevel/sideEffectScope/needsApproval/alwaysAsk；ToolResultBudget 声明 maxInlineBytes/maxModelBytes 与 inline/truncate/artifact 策略；ToolTimeoutPolicy 区分 timed/untimed。initializeRuntimeTooling 按端口与配置门控注册：Skill 需要 skillPort、Agent 需要 subagentPort、submit_result/escalate 需要 workflow 提交端口、自动化工具在子代理会话不暴露、node_repl 由官方插件启停推导。"
+          ],
+          "evidence": [
+            "ev-runtime-tools"
+          ]
+        },
+        {
+          "id": "schedule",
+          "title": "依赖感知的并发调度",
+          "body": [
+            "ToolScheduler 从工具元数据推导依赖（如写文件依赖同文件的读），把无依赖的只读并发安全工具分到同一批并行执行，默认最大并发 10；每批产生 batch_start/tool_complete 事件驱动 UI 进度。"
+          ],
+          "evidence": [
+            "ev-tools-schedule"
+          ]
+        },
+        {
+          "id": "normalize",
+          "title": "归一化在钩子之前",
+          "body": [
+            "resolveInput 把模型给的入参换成\"将要发生的执行事实\"（如把相对路径解析为绝对路径、展开命令字符串）。源码注释解释了这个位置为何刻意放在钩子之前：此后钩子、权限规则、确认窗载荷与 handler 读的是同一份输入——\"策略看得到真正的脚本\"\"确认与执行同字节\"。"
+          ],
+          "evidence": [
+            "ev-tool-normalize"
+          ]
+        },
+        {
+          "id": "serialize",
+          "title": "结果预算与工件落盘",
+          "body": [
+            "serializeOutput 按预算处理结果：未超限原样返回；strategy=artifact 且工件启用时全量写入 artifactStore，模型只收到 <persisted-output> 预览与 persistedPath；否则截断并追加 [Tool output truncated by resultBudget: …] 标记。Bash 默认预算 30KB artifact 策略，MCP 工具默认 50KB truncate。"
+          ],
+          "evidence": [
+            "ev-tool-artifact"
+          ]
+        },
+        {
+          "id": "streaming-tools",
+          "title": "流式期间的提前执行",
+          "body": [
+            "streamingToolCoordinator 在模型还在生成时就可执行满足准入的工具：readOnly 且 concurrentSafe 且非 destructive 且不需要审批且 sideEffectScope=none；流失败时以已提交的工具结果为锚恢复，避免重放副作用。"
+          ]
+        }
+      ],
+      "principle": [
+        "副作用声明先行：readOnly/destructive/concurrentSafe/sideEffectScope 是工具元数据的一部分，调度、权限、流式准入、压缩保护都读声明而非在调用点猜测。",
+        "\"确认与执行同字节\"：归一化后单一输入事实贯穿钩子、权限、确认窗与 handler，消除了\"批准的是 A 执行的是 B\"这类竞态。"
+      ],
+      "limits": [
+        "大结果落盘依赖 artifactStore 的保留策略（session 级），跨会话检索工件的能力未深读。",
+        "MCP 工具的权限固定 needsApproval=true，但 plan 模式对非破坏 MCP 工具放行，是权限机制里值得注意的特例。"
+      ],
+      "evidence": [
+        "ev-runtime-tools",
+        "ev-tools-schedule",
+        "ev-tool-normalize",
+        "ev-tool-artifact"
+      ]
+    },
+    {
+      "id": "permission",
+      "nav_title": "权限与审批",
+      "title": "五种协作模式的判定顺序与审批竞速",
+      "question": "plan/build/edit/yolo/auto 模式如何裁决一次工具调用？被拒的请求如何回到模型？",
+      "answer": "checkPermission 按固定顺序短路：plan 模式转换工具 → requiresUserInteraction 一律 ask → alwaysAsk 工具（连 yolo 都绕不过）→ yolo 直通 → auto 拒绝（保留未实现）→ disallowedTools 与项目 deny 规则 → plan 模式检查（只读放行）→ 项目 allow 规则与预批通道 → 配置 allowedTools → edit 模式 → build 兜底（只读放行、高风险 ask、其余按副作用）。需要用户审批时，客户端确认窗（PermissionBroker）与 PermissionRequest 钩子链并发竞速，先到者生效；deny 以权限错误作为工具结果回灌模型。",
+      "steps": [
+        {
+          "id": "order",
+          "title": "固定顺序的短路判定",
+          "body": [
+            "源码顺序即语义优先级：alwaysAsk 的判定在 yolo 直通之前，注释明言\"声明 alwaysAsk 的工具必须经过用户确认，不能被权限模式的放行分支绕过\"；auto 模式命中即 deny（reserved but not implemented）。规则匹配支持 command/url/file_path 等主体提取与 prefix:*/通配。"
+          ],
+          "evidence": [
+            "ev-perm-order"
+          ]
+        },
+        {
+          "id": "ask-race",
+          "title": "审批竞速：确认窗 vs 钩子链",
+          "body": [
+            "需要审批时先发 PermissionRequested 事件渲染确认窗，然后 racePermissionResponders 让 PermissionBroker 与 PermissionRequest 钩子链并发应答。源码注释记录了这里的一次真实修复：曾经串行 await 钩子链，同步钩子阻塞期间确认窗已渲染但应答 deferred 未注册，用户每次点击都被幂等语义静默丢弃——确认窗永久死亡。修法是并发竞速，钩子链故障只令其退赛而不替用户做拒绝决定。"
+          ],
+          "evidence": [
+            "ev-perm-race"
+          ]
+        },
+        {
+          "id": "deny",
+          "title": "拒绝的流转与规则持久化",
+          "body": [
+            "deny 先发 PermissionDenied 事件，再以权限错误作为 tool result 返回给模型（模型可以换方式重试）；allow 时可携带 permissionUpdates。项目级规则持久化在 SQLite local_setting 表（namespace=permission）；会话级\"总是允许\"只存内存随会话消亡。无客户端时默认 DenyPermissionBroker 直接拒绝——fail-closed。"
+          ],
+          "branches": [
+            {
+              "condition": "broker 先应答",
+              "effect": "用户决定生效（allow once/always/deny）"
+            },
+            {
+              "condition": "钩子链先应答",
+              "effect": "钩子决定生效；modify 会改写输入并重新校验+重查权限"
+            }
+          ]
+        }
+      ],
+      "principle": [
+        "权限模型以\"声明 + 顺序短路\"实现可预测性：每种模式的放行/拦截范围都能从 checkPermission 的分支顺序直接读出。",
+        "审批应答方竞速而非串行，是把\"外部审批桥接\"与\"本地确认窗\"两个时序不可控的应答源统一起来的最小方案。"
+      ],
+      "limits": [
+        "auto 模式保留未实现，命中即拒绝。",
+        "没有内核级沙箱：dangerouslyDisableSandbox 字段全仓无行为消费者，exec adapter 注释直言 sandbox 已撤除——隔离实际由审批与规则承担（详见命令执行机制）。"
+      ],
+      "evidence": [
+        "ev-perm-order",
+        "ev-perm-race"
+      ]
+    },
+    {
+      "id": "context-compact",
+      "nav_title": "上下文压缩",
+      "title": "上下文预算与两级压缩",
+      "question": "上下文接近模型上限时系统如何自救？压缩保留了什么、丢掉了什么？",
+      "answer": "token 统计优先锚定 provider 返回的真实 usage，再叠加其后消息的本地估算（中文按 2 倍字符计）。auto compact 阈值 = contextWindow − min(maxOutputTokens, 21K) − 13K buffer，默认 200K 窗口即约 166K 触发，连续失败熔断 3 次。压缩分两级：microcompact 无模型调用，只清理旧工具结果（保留最近 5 组，节省不足 256 token 放弃）；全量 compact 用当前会话模型生成结构化摘要，保留 context prefix 与最近一组 assistant 轮，然后整体替换历史并写 CompactBoundary 事件。provider 报上下文超限后还有反应式 compact 兜底。",
+      "steps": [
+        {
+          "id": "estimate",
+          "title": "token 估算与 provider 锚定",
+          "body": [
+            "本地估算是字符近似（除数 3，中文双倍），只用于增量；基数优先取最近一次已提交 assistant 的真实 usage（contextUsageTokens ?? inputTokens）。两者合成 tokenCount = providerBase + incremental，避免纯估算漂移。"
+          ]
+        },
+        {
+          "id": "threshold",
+          "title": "阈值公式与输出预留",
+          "body": [
+            "源码把\"输出预留\"与\"压缩窗口\"收敛为同一套常量：有效窗口 = contextWindow − min(maxOutputTokens, 21K)；阈值 = 有效窗口 − 13K buffer。注释解释了动机：provider 的窗口是输入输出共享的，自动压缩只能让出输入侧，分母必须先扣掉输出预留；旧 legacy 分支按完整输出预留会过早压缩。"
+          ],
+          "evidence": [
+            "ev-compact-const",
+            "ev-compact-formula"
+          ]
+        },
+        {
+          "id": "micro",
+          "title": "microcompact：无模型清理",
+          "body": [
+            "阈值更早（约 autoThreshold 的 90% 或减 2000），只清理 Read/Bash/Grep/Glob/WebFetch/WebSearch/Edit/Write/ApplyPatch 的旧工具结果，保留最近 5 组，替换为 [Old tool result content cleared]；媒体结果受保护，预计节省不足 256 token 就放弃。copy-on-write 应用到历史。"
+          ]
+        },
+        {
+          "id": "full",
+          "title": "全量 compact：同一模型生成摘要",
+          "body": [
+            "compactActiveConversation 用会话当前模型（非独立摘要模型）发起无工具约束的摘要请求，prompt 要求输出 <analysis>+<summary> 九段结构，输出上限 min(模型上限, 20K)。保留 context prefix（system 消息+技能清单等附件）与触发时最近一组 assistant 轮；其余全部进摘要。prompt-too-long 时逐级降级：按 token 差额多保留几组 → 截断最旧轮次，最多重试 3 次。完成后写 CompactBoundary（含前后 token 数）、replaceMessages 并清空已读文件状态。"
+          ],
+          "state": "messageHistory 整体替换为 [prefix, 摘要消息, 保留轮, 后置 reminder]",
+          "evidence": [
+            "ev-compact-active"
+          ]
+        },
+        {
+          "id": "reactive",
+          "title": "反应式压缩与熔断",
+          "body": [
+            "若 provider 仍报上下文超限（finishReason 判定），不再抛流异常而是触发反应式 compact 后重试；rapid-refill 熔断（连续 3 次）防止\"压缩→立刻填满\"死循环。"
+          ]
+        }
+      ],
+      "principle": [
+        "一套常量管两种预算：输出预留同时约束请求 max_tokens 与压缩阈值，源码注释明言否则\"请求预算和压缩窗口会继续按两套常量计算\"而漂移。",
+        "压缩后历史仍是普通消息序列（prefix+摘要+保留轮），对 provider 与持久化完全透明，不需要特殊分支。"
+      ],
+      "limits": [
+        "摘要质量依赖同一模型，长会话摘要可能丢失细节；摘要是\"文档化意图\"层面的描述，实际保真度未运行验证。",
+        "microcompact 的空闲 60 分钟触发路径未逐行验证。"
+      ],
+      "evidence": [
+        "ev-compact-const",
+        "ev-compact-formula",
+        "ev-compact-active"
+      ]
+    },
+    {
+      "id": "memory-reminder",
+      "nav_title": "记忆与注入",
+      "title": "指令、记忆与元信息的上下文注入面",
+      "question": "AGENTS.md、自动记忆、技能清单这些\"模型看不见文件系统就该知道的事\"如何进入上下文？",
+      "answer": "上下文是预算化的投影：ContextBuilder 把多路来源合成到请求里。AGENTS.md（用户级+项目级，上限 100KB）与项目记忆索引 MEMORY.md 合成 # agentsMd meta_user 块；<system-reminder> 通道分 prefix/persisted/per-request 三类共 30 个来源（todo 提醒、插话包装、附件伪装等），带严格转义防嵌套伪造；技能清单按字母序注入，超预算退化为纯名字列表；Bash 的 shell prelude 还会把 find()/grep() 路由到打包的快速搜索二进制。",
+      "steps": [
+        {
+          "id": "agentsmd",
+          "title": "AGENTS.md 与记忆索引合成",
+          "body": [
+            "# agentsMd 块以固定声明开头（OVERRIDE any default behavior），下面拼 AGENTS.md 内容；项目记忆另有格式化标题 \"Contents of <root>/MEMORY.md (user's auto-memory, persists across conversations)\"。索引有 200 行/25000 字符的截断阈值。"
+          ],
+          "evidence": [
+            "ev-agentsmd-memory"
+          ]
+        },
+        {
+          "id": "memory-write",
+          "title": "自动记忆的后台抽取",
+          "body": [
+            "每轮成功完成后调度后台子代理（同一主模型但压到最低推理档、输出 ≤5K、最多 5 轮）读取最近消息，决定是否把值得长期记住的事实写入 memories/projects/<slug>-<hash>/memory/。写权限收敛：只允许 Write/Edit 目录内 .md、只读 Bash + 目录内 rm；敏感路径段黑名单；写入时补 metadata.originSessionId。无价值时只输出 Nothing to save."
+          ]
+        },
+        {
+          "id": "reminders",
+          "title": "system-reminder 三类通道",
+          "body": [
+            "prefix 类（context_prefix、skills_listing）进请求前缀；persisted 类（todo_reminder、goal_state_change、rewind_notice 等 15 种）持久进历史；per-request 类（runtime_mode、incoming_message、hook_context 等 10 种）每轮重注入。wrapSystemReminderForSource 统一包裹并防伪造；哪些来源可被 provider 移到 system 侧由 MCS 集合决定。"
+          ],
+          "evidence": [
+            "ev-sysreminder"
+          ]
+        },
+        {
+          "id": "skills",
+          "title": "技能清单注入与 Skill 工具",
+          "body": [
+            "技能发现按根优先级扫描 SKILL.md（插件范围不跟随符号链接防逃逸），清单以 \"The following skills are available for use with the Skill tool:\" 开头逐条列名称+描述+路径；总长超预算（20000 字符）就退化为纯名字列表。模型需要内容时调 Skill 工具，loadSkill 上限 100KB，输出包裹 <skill_content> 并把 $ZCODE_SKILL_DIR 替换为技能目录。"
+          ],
+          "evidence": [
+            "ev-skills-listing"
+          ]
+        },
+        {
+          "id": "embedded-search",
+          "title": "嵌入式搜索替换 find/grep",
+          "body": [
+            "CLI 打包 bfs/ugrep/ripgrep 二进制，通过 Bash shell prelude 注入函数：find() 映射到 bfs -S dfs，grep() 映射到 ugrep -G --ignore-files…，rg 不存在时定义 fallback；ugrep 的 -z/-Z 语义不同会绕回系统 grep。启用后独立的 Glob/Grep 工具注销并从模型可见工具表过滤。"
+          ],
+          "evidence": [
+            "ev-embedded-search"
+          ]
+        }
+      ],
+      "principle": [
+        "每类注入都有字符预算与退化路径（截断/纯名字列表），元信息永远不会挤占工作上下文。",
+        "写入路径与读取路径同样收敛：自动记忆只能写指定目录的 .md，敏感路径黑名单在路径解析层拦截。"
+      ],
+      "limits": [
+        "记忆抽取的判定质量取决于模型本身；抽取 prompt 只看最近若干条消息。",
+        "system-reminder 伪造成防护依赖转义与 MCS 集合，属于纵深防御而非硬隔离。"
+      ],
+      "evidence": [
+        "ev-agentsmd-memory",
+        "ev-sysreminder",
+        "ev-skills-listing",
+        "ev-embedded-search",
+        "ev-memory"
+      ]
+    },
+    {
+      "id": "session-state",
+      "nav_title": "会话持久化",
+      "title": "事件溯源、投影与文件检查点",
+      "question": "会话、消息与文件改动如何持久化？fork/rewind 为什么是可能的？",
+      "answer": "一切会话状态变更先写 SQLite 事件存储，投影（UI 可见的消息序列）随时可以由 getEvents+reduce 重建。会话首轮 ensureSessionPersisted 落库（projectID 由目录派生、标题取首条输入）；用户/助手消息与 part 级更新经原子事务持久化；Edit/Write 成功后把 originalFile+structuredPatch 存为 Workspace 工件并发 CheckCreated 事件，rewind 按消息或 checkpointId 定位恢复。",
+      "steps": [
+        {
+          "id": "create",
+          "title": "会话落库",
+          "body": [
+            "AgentRuntime 构造时不落库；首轮 ensureSessionPersisted 才写 session 行（id、projectID、workspaceID、directory、title=首条输入、permission mode 等），并同步持久化模型选型、shell 快照与执行状态 entry，补发 SessionTitleUpdated 事件。"
+          ],
+          "evidence": [
+            "ev-session-create"
+          ]
+        },
+        {
+          "id": "events",
+          "title": "事件先于一切",
+          "body": [
+            "事件存储 append 先落库再通知 sink；流式/进度类高频事件按 100 条聚合写摘要日志。投影 rebuild = eventStore.getEvents + eventReducer.reduce，因此 compact 替换历史、fork 派生、UI 重放都是同一套事件语义。"
+          ],
+          "evidence": [
+            "ev-event-store"
+          ]
+        },
+        {
+          "id": "persistence",
+          "title": "消息与 part 的原子持久化",
+          "body": [
+            "persistUserPrompt 把排队晋升做成原子事务；persistAssistantMessage 与 persistPart 覆盖流式过程中的 assistant 消息与每种 part（14 种 union）。SQLite 实现在 adapters/storage/session-store（迁移+仓储分层）。"
+          ],
+          "evidence": [
+            "ev-sqlite-store"
+          ]
+        },
+        {
+          "id": "checkpoint",
+          "title": "文件检查点与 rewind",
+          "body": [
+            "每次成功的 Edit/Write 后，runtime 从工具输出提取 filePath/structuredPatch/originalFile 序列化为 WorkspaceCheckpointArtifact 写入 artifactStore 并发 CheckpointCreated 事件。rewind 入口按 checkpointId 或消息位置选择检查点恢复文件内容；不可恢复时返回明确的原因文案。"
+          ],
+          "evidence": [
+            "ev-rewind"
+          ]
+        }
+      ],
+      "principle": [
+        "事件溯源让 fork、compact、rewind、UI 重放共享同一份事实来源，避免多写路径——AGENTS.md 明令\"避免重复状态和多条写入路径\"。",
+        "检查点记录的是 patch+原始内容而非整库快照，存储成本随改动量而非项目大小增长。"
+      ],
+      "limits": [
+        "SQLite migrations 的具体表结构未逐一核对。",
+        "session-fork（1487 行）与 rewind 执行入口未逐行阅读，结论来自事件流与辅助函数证据。"
+      ],
+      "evidence": [
+        "ev-session-create",
+        "ev-event-store",
+        "ev-sqlite-store",
+        "ev-rewind",
+        "ev-sqlite-store"
+      ]
+    },
+    {
+      "id": "subagent-workflow",
+      "nav_title": "子代理与工作流",
+      "title": "子代理派发与双工作流体系",
+      "question": "主代理如何派发子代理？TS 脚本工作流如何跑在沙箱里？",
+      "answer": "Agent（别名 Task）工具经 subagentPort.launch 派发子代理：每个子代理是全新的 child AgentRuntime + 独立 sessionId，只继承父的指令快照与灰度门，不继承 Project Context；前台运行可被用户转后台或超时自动转后台，后台完成经 runtime 命令队列以合成消息回流父会话。动态工作流（dwf）是同一思想的编排化：CreateWorkflow 对 TS 脚本做类型检查后，把脚本放进受控 node 子进程（vm 裸 context）运行，脚本的 agent.ask 调用经 NDJSON 桥接回宿主 WorkflowEngine，每个 actor 同样是一个持久 child runtime。旧 Workflow（/expert 斜杠命令、声明式 JSON）与 dwf 并存。",
+      "steps": [
+        {
+          "id": "agent-tool",
+          "title": "Agent/Task 工具与端口",
+          "body": [
+            "Agent 工具 handler 调 context.subagentPort.launch，声明 concurrentSafe=true 并在描述里鼓励同一条消息发多个调用实现并发；Task 是 Claude Code 兼容别名（providerVisible:false）。缺省 subagent_type 为 general-purpose。"
+          ],
+          "evidence": [
+            "ev-agent-tool"
+          ]
+        },
+        {
+          "id": "child-runtime",
+          "title": "child runtime 的隔离边界",
+          "body": [
+            "子代理拿到 new AgentRuntime(childSessionId, …)：模型选型克隆自父回合快照、流式配置继承、指令只复用父已解析的快照（\"Project Context 仍不继承\"）、maxTurns 默认 4、taskType=subagent_child、动态工作流灰度门结构性继承防止用子代理绕过灰度。"
+          ],
+          "evidence": [
+            "ev-subagent-child",
+            "ev-subagent-isolation"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "title": "前台/后台与结果回传",
+          "body": [
+            "前台 run 用 Promise.race 在完成/用户转后台/autoBackground 超时之间裁决，超时自动转后台返回 async_launched；后台完成把结果写入 runtime task registry，经后台通知管线（priority=next）排空时合成一条 model-only 消息进入父会话下一轮。父只看到子的最终文本与少量镜像工具事件，raw 子正文不污染父时间线。SendMessage 可对运行中的子代理 steering，对已终态的子代理后台 resume。"
+          ],
+          "evidence": [
+            "ev-sub-lifecycle"
+          ]
+        },
+        {
+          "id": "dwf-engine",
+          "title": "dwf：脚本沙箱 + 宿主引擎",
+          "body": [
+            "CreateWorkflow 把脚本针对内嵌 facade d.ts 类型检查 → 用户确认 → lowering 成仅依赖 __host 的 async 函数体 → 写入 <cwd>/.zcode/workflow-runs/<runId>.mjs → spawn(node, 256MB 堆上限) 独立子进程。子进程里 vm.createContext 裸 context 无 process/require/fetch、禁动态 import；脚本的 __host.ask/enterPhase/report 等调用经 NDJSON 桥接到父进程 WorkflowEngine，引擎再驱动各 actor 的持久 child runtime。abort 是唯一\"真取消\"，initiator 区分 model/user/interrupted/superseded。"
+          ],
+          "branches": [
+            {
+              "condition": "脚本抛错/子进程崩溃/墙钟超时/JSON 解析失败",
+              "effect": "engine.fail，结算 failed",
+              "target": "dwf-engine"
+            },
+            {
+              "condition": "abort 信号",
+              "effect": "engine.stop(initiator)，结算 stopped",
+              "target": "dwf-engine"
+            }
+          ],
+          "evidence": [
+            "ev-dwf-harness"
+          ]
+        },
+        {
+          "id": "legacy",
+          "title": "legacy Workflow 与并发",
+          "body": [
+            "旧 Workflow 是声明式 JSON 定义 + DAG 调度器（maxConcurrentLoops 默认 2），触发面是 /expert、/workflow 斜杠命令；runtime-task registry 刻意区分 local_workflow 与 local_dynamic_workflow（前者不可取消）。子代理并发没有全局信号量，实际受单回合工具调度并发（10）约束。"
+          ]
+        }
+      ],
+      "principle": [
+        "一切编排单元都是会话：子代理、dwf actor、workflow child、cron 轮复用同一 AgentRuntime/事件/权限设施，新增编排形态不需要新的执行内核。",
+        "沙箱分层：脚本沙箱（vm 裸 context+一次性进程）防的是意外与资源滥用；安全边界仍由权限审批承担——源码注释明言\"vm 不是安全沙箱，隔离仍由上层权限与审批 gate 承担\"。"
+      ],
+      "limits": [
+        "子代理结果回传的打分与截断细节未逐行验证。",
+        "引擎 AIMD 并发（429 降 25%、连续成功+1）的参数只在注释与实现中确认，未实测。"
+      ],
+      "evidence": [
+        "ev-agent-tool",
+        "ev-subagent-child",
+        "ev-subagent-isolation",
+        "ev-sub-lifecycle",
+        "ev-dwf-harness"
+      ]
+    },
+    {
+      "id": "protocol",
+      "nav_title": "协议栈",
+      "title": "两代协议、命令收口与 Channel RPC",
+      "question": "宿主与 Agent 子进程、客户端与宿主之间分别说什么协议？命令如何被串行收口？",
+      "answer": "仓库有三层协议：Agent 子进程与宿主之间的 stdio NDJSON（legacy ZCode Protocol，四类消息+zod 校验）；其上的 V4——conversation/sessions-index/workspace-config 三个主题的 snapshot+delta 发布订阅，物理帧 >1MiB 分片+crc32，订阅复用同一条 NDJSON 管道；客户端（浏览器/桌面 Renderer）与 server/Host 之间则是另一套 VS Code 风格的二进制 Channel RPC（call/listen + ProxyChannel 自动代理）。V4 命令经 CommandInbox 按会话串行 admission 并幂等去重。",
+      "steps": [
+        {
+          "id": "legacy",
+          "title": "legacy：stdio 上的 NDJSON",
+          "body": [
+            "发送即 JSON.stringify + \\n；接收按行切分、逐行 zod 校验后分发，解析错误回 JSON-RPC 风格的 -32700/-32600。方法全集覆盖 session/workspace/provider/plugins/workflows/automation/offPeak/mcp 等约 60 个方法与反向请求（requestPermission/requestUserInput 等）。"
+          ],
+          "evidence": [
+            "ev-ndjson"
+          ]
+        },
+        {
+          "id": "v4-topics",
+          "title": "V4：主题化 snapshot+delta",
+          "body": [
+            "V4 把会话状态建模为三个主题，订阅先回 ACK，initial snapshot 与后续 delta 走 owned notification v4/conversation/frame。wire 层区分 complete 与 fragment 帧（>1MiB 逻辑帧按 UTF-8 字节分片，crc32+base64，分片上限 1024）。包纪律严格：\"只放 schema 类型 + 纯函数，禁止任何运行时/IO/传输逻辑\"；wire 版本 3 且标注未冻结。"
+          ],
+          "evidence": [
+            "ev-v4-discipline",
+            "ev-v4-transport"
+          ]
+        },
+        {
+          "id": "profiles",
+          "title": "两种 delivery profile",
+          "body": [
+            "continuous（桌面）：30ms flush 窗口、流式文本全开、256KiB 流式输出上限、不推工具进度；replayable（Web/手机）：150ms、只推文本行与工具进度、无流式正文。客户端代码禁止出现 profile 变量——profile 只存在于 CLI flush 管线的参数表。"
+          ],
+          "evidence": [
+            "ev-v4-profiles"
+          ]
+        },
+        {
+          "id": "inbox",
+          "title": "CommandInbox 串行 admission",
+          "body": [
+            "V4 网关的命令收口保证：同一会话不同 commandId 按 CLI 实际 admission 顺序串行（key gate → per-session admission gate 的固定锁序，session gate 持有到 settle 才释放）；幂等表 in-flight/live 永久 pinned、settled 进每会话 512 条 LRU；重复命令共享同一 final promise，duplicate ACK 不覆盖 failed 终态。"
+          ],
+          "evidence": [
+            "ev-inbox"
+          ]
+        },
+        {
+          "id": "channel-rpc",
+          "title": "客户端侧的 Channel RPC",
+          "body": [
+            "rpc 包七层：VQL 序列化、ISocket 抽象 + 13 字节帧头分帧、PersistentProtocol（ACK/keepAlive/断线重放）、ChannelServer/Client 的 call/listen、IPCServer 1:N、ProxyChannel fromService/toService 自动代理、远程连接。服务端把 ServiceCollection 里的服务逐个暴露为 channel，客户端 RemoteServiceAccess 用 ES6 Proxy 生成类型安全访问器。"
+          ],
+          "evidence": [
+            "ev-rpc-layers"
+          ]
+        }
+      ],
+      "principle": [
+        "schema 与运行时严格分层：协议包只有 zod schema 与纯函数，通道缓冲、订阅注册表、调度都在 bootstrap 网关——协议演进不拖累传输实现。",
+        "legacy 与 V4 并存同管道，文件头注释直言 legacy 栈删除时\"本文件整体删除\"——旧协议进入维护态，新能力只进 V4。"
+      ],
+      "limits": [
+        "V4 wire v3 自述\"未冻结，schema 定型以黄金测试为准\"。",
+        "v4-gateway（约 3400 行）的内部调度细节只读了头部与关键路径，未逐行核对。"
+      ],
+      "evidence": [
+        "ev-ndjson",
+        "ev-v4-discipline",
+        "ev-v4-transport",
+        "ev-v4-profiles",
+        "ev-inbox",
+        "ev-rpc-layers"
+      ]
+    },
+    {
+      "id": "desktop-web",
+      "nav_title": "桌面与 Web 拓扑",
+      "title": "三进程桌面、单进程 Web 与远程 workspace",
+      "question": "桌面三进程如何分工？Web 形态如何做到单进程托管页面与 Agent？远程 workspace 如何接入？",
+      "answer": "桌面是四类进程：Electron Main（窗口与原生能力）、每窗口一个的 Host UtilityProcess（全部业务服务+远程连接注册表）、Renderer（薄壳）、以及 cron/off-peak 调度进程。Agent CLI 子进程由 services 层按 workspaceKey 惰性 spawn，崩溃或超时被回收后下次调用重建（惰性换新而非自动 respawn）。Web 形态是一个 Hono 进程：静态托管前端 + /api + 三个 WS 端点；/ws 永远是 terminal-client，受信桌面 Host 才能凭一次性 capability ticket 走 /ws/host。远程 workspace 经 SSH/WSL/Docker 三后端部署远端 server 并做 hello 握手，浏览器经 /ws/remote/:id 只桥接四个文件面服务。",
+      "steps": [
+        {
+          "id": "electron",
+          "title": "每窗口一个 Host",
+          "body": [
+            "Host 入口文件头画出了拓扑：同一窗口的 Renderer 和手机都 attachment 到 Host，Host 内是 local services + remote connection registry。Main 用 utilityProcess.fork 创建 Host 并只发一次 init-local；ServicePort 经 MessageChannel 转交 preload 再 transfer 进 renderer。Host/CLI 生命周期属于窗口而非 renderer 加载周期——reload 只给存活 Host 补挂新端口，否则运行中的 CLI 会话直接消失。"
+          ],
+          "evidence": [
+            "ev-host-diagram"
+          ]
+        },
+        {
+          "id": "agent-process",
+          "title": "Agent 子进程的生老病死",
+          "body": [
+            "spawn 命令解析优先级：ZCODE_AGENT_SERVER_COMMAND env → monorepo dev（node zcode.cjs app-server --stdio）→ 桌面打包态（Electron 内置 Node，ELECTRON_RUN_AS_NODE=1，体积 ~180MB→~16MB）→ 已部署原生 binary。POSIX 下 detached 独立进程组便于整树回收；崩溃（stdio close）与请求超时（视为链路不可信）都把 workspace 从进程池删除，等下次 getClient 重建；空闲回收、代际（generation）防旧启动请求复活。"
+          ],
+          "evidence": [
+            "ev-spawn"
+          ]
+        },
+        {
+          "id": "web-server",
+          "title": "单进程双职责与鉴权",
+          "body": [
+            "entry-http 里 createLocalServices 创建全部服务，createHttpServer 同时静态托管 Web 产物（SPA fallback+目录穿越防护）并暴露 /api 与 WS。token 中间件只保护 /ws 与 /api/*；/ws 永远按 web-remote-replayable 建连（注释：浏览器设置旧 mode header 也不能把自己提升为 trusted host）；/ws/host 需要一次性 30 秒 TTL 的 capability ticket。独立守护形态 zcode-server-cli 的 Core 更保守：强制 loopback，非 loopback 直接抛错 fail-closed。"
+          ],
+          "evidence": [
+            "ev-server-ws",
+            "ev-server-cli"
+          ]
+        },
+        {
+          "id": "remote",
+          "title": "远程 workspace：detect→deploy→exec→hello",
+          "body": [
+            "IRemoteBackend 三实现（ssh2/wsl/docker）；连接流程：detect 远端平台架构 → deployServer 按需上传 Node runtime、server bundle、node-pty、Agent runtime（组件级 CDN 缓存）→ exec 启动远端 entry-stdio 并注入 desktop-attached-remote 身份 → 逐行读 stdout 直到 zcode-hello JSON 握手（跳过 SSH banner）→ stdio 包装成 ChannelClient。浏览器经 /api/connect-remote + /ws/remote/:id 桥接，一个 id 只允许一个 WS 客户端，只注册 file/git/system/terminal 四个服务。"
+          ],
+          "evidence": [
+            "ev-remote"
+          ]
+        },
+        {
+          "id": "modes",
+          "title": "desktop-continuous vs web-remote-replayable",
+          "body": [
+            "两种 clientMode 决定 V4 hello 的 delivery profile 与能力位（nativeDialogs/localTerminal 仅 continuous）。可信载体用 __zcodeTrustedV4Connection 私有字段覆盖 UI 入参，Renderer/手机不能伪造 clientMode。AGENTS.md 明令：修改 stream/snapshot/queue/重连时必须同时验证两种语义。"
+          ]
+        }
+      ],
+      "principle": [
+        "会话属于宿主而非窗口加载周期：Renderer 可死可重载，Host 与 Agent 子进程不受影响——这是桌面端把 services 从 Main 拆到 Host 的根本理由。",
+        "Main 与外部 relay 只做鉴权、配对、转发与 attachment 调度，不保存任务队列/快照等业务状态（AGENTS.md 契约）。"
+      ],
+      "limits": [
+        "/ws/host 在仓库内未检索到直接消费方，\"Desktop Host 附加入口\"是推断；手机桥接入口 attachRemoteWorkspaceSessionHost 在 desktop 内也无活跃调用方。",
+        "Host 自身意外退出没有自动 respawn（exit 回调只做清理），恢复依赖用户刷新窗口重挂。"
+      ],
+      "evidence": [
+        "ev-host-diagram",
+        "ev-spawn",
+        "ev-server-ws",
+        "ev-server-cli",
+        "ev-remote"
+      ]
+    },
+    {
+      "id": "model-provider",
+      "nav_title": "模型链路",
+      "title": "从模型目录到 HTTP 请求",
+      "question": "provider/模型配置如何变成一次带正确鉴权与参数的 HTTP 请求？",
+      "answer": "provider 纯域包定义三种 API 类型（anthropic-messages/openai-chat-completions/openai-responses）与两类鉴权（api-key、zhipu 账号族），模型目录带 contextWindow、输入格式与 optionSpecs（reasoningLevel/maxOutputTokens）。运行时由 adapters 的 AiSdkModelAdapter（基于 Vercel AI SDK）执行：bindModel 冻结 Provider 事实，请求经过一条 fetch 洋葱——Coding Plan 网关改写 → 代理感知 fetch（httpProxy/caCert）→ 业务错误归一 → option map body 改写（非文本 body 一律 fail-closed）→ SDK compat fetch。",
+      "steps": [
+        {
+          "id": "config",
+          "title": "Provider 配置与模型目录",
+          "body": [
+            "provider-data-schema 用 zod 定义 API 类型三选一、分组（standard-personal/zai-family/bigmodel-family）、鉴权判别联合（含 zhipu-account 的 start/individual/team/off-peak 模式）；模型 properties 含 contextWindow、inputFormat（image/video/audio/pdf）、supportsToolCall 等。内置目录可从官方 CDN 下载并物化缓存（20s 总预算）。"
+          ]
+        },
+        {
+          "id": "adapter",
+          "title": "AiSdkModelAdapter 与 Model 契约",
+          "body": [
+            "core 只依赖 contracts 的 Model 接口（generateText/streamText 返回 AsyncIterable<ModelEvent>）；bootstrap 注入 createModelAdapter 薄包装 AiSdkModelAdapter。AI SDK 的 TextStreamPart 经 toModelStreamEvent 归一化为内部事件（text-delta/reasoning/tool-call）。"
+          ],
+          "evidence": [
+            "ev-model-stream"
+          ]
+        },
+        {
+          "id": "fetch-onion",
+          "title": "fetch 洋葱与 provider 工厂",
+          "body": [
+            "API 类型映射到 SDK 工厂：anthropic→createAnthropic（带 compat fetch）、openai-responses→createOpenAI、openai-compatible→createOpenAICompatible（includeUsage:true、supportsStructuredOutputs 按 binding 能力）。传输层按 provider 缓存：官方 Coding Plan 端点先替换为平台网关端点，再进入用户 HTTP 代理 fetch——httpProxy/noProxy 按实际发送地址判定。"
+          ],
+          "evidence": [
+            "ev-model-provider",
+            "ev-provider-transport"
+          ]
+        },
+        {
+          "id": "option-map",
+          "title": "Option Map DSL 改写请求体",
+          "body": [
+            "reasoningLevel/maxOutputTokens 是仅有的两个模型 Option，由受限 CEL DSL 编译（tokenizer/parser/evaluator + 三级缓存），按 option 顺序对 JSON body 做 RFC-7386 Merge Patch；改写发生在自定义 fetch 里，注释明言 Option Map 是这两项的唯一请求字段权威，非文本 Body 必须 fail-closed。"
+          ],
+          "evidence": [
+            "ev-option-map"
+          ]
+        },
+        {
+          "id": "patches",
+          "title": "对 AI SDK 的补丁",
+          "body": [
+            "根 package.json 的 patchedDependencies 给 @ai-sdk/anthropic 与 @ai-sdk/openai-compatible 打补丁：在消息转换中新增 video/* 内容块（Anthropic 官方尚无 video block，按 image-block 同构形状兼容）。第三个补丁与 LLM 链路无关（ARMS RUM 监控）。"
+          ]
+        }
+      ],
+      "principle": [
+        "模型能力用声明目录而非硬编码分支：contextWindow 驱动压缩阈值，inputFormat 驱动媒体投影，optionSpecs 驱动请求改写——新增模型不改执行代码。",
+        "跨 provider 行为差异收敛在 fetch 层与补丁层，执行核心不感知供应商。"
+      ],
+      "limits": [
+        "OTel 观测点（turn/step/tool/model span）在 telemetry 包，默认采样 0.1、无 endpoint 时完全不加载 SDK。",
+        "流式重试与失败分类（failure-classifier）未逐行阅读。"
+      ],
+      "evidence": [
+        "ev-model-provider",
+        "ev-provider-transport",
+        "ev-option-map",
+        "ev-model-stream"
+      ]
+    },
+    {
+      "id": "plugin-skill",
+      "nav_title": "插件与技能",
+      "title": "插件市场、内置播种与技能生态",
+      "question": "插件从哪里来、如何播种？\"卸载内置插件\"为什么不删缓存？",
+      "answer": "plugin.json 声明 commands/agents/skills/hooks/mcpServers/userConfig（兼容 .zcode/.claude/.codex 三套 manifest 路径）。发现层从四类候选来源收集插件（inline、官方市场缓存、installed.json 安装记录、config dirs），id=<name>@<marketplace>，启停读 enabledPlugins ?? defaultEnabled。内置官方插件启动时播种进官方市场缓存（sha256 校验、15 秒文件锁预算、失败回滚）；\"卸载\"只写 suppressedBuiltins 抑制标记——缓存是不可变产品资产，恢复内置插件就是清除标记重新播种。官方市场由 bundled+CDN 两分片合并，CDN zip 强制 sha256。",
+      "steps": [
+        {
+          "id": "manifest",
+          "title": "manifest 与组件装配",
+          "body": [
+            "PluginManifest 含 name/version/agents/commands/hooks/mcpServers/userConfig/dependencies；channels/lspServers/outputStyles/settings 仅诊断用，运行时拒绝并告警。启用态下组件物化：skills/commands roots 并入发现、manifest commands 生成为 generated-commands 根、hooks 按 schema 校验、MCP server 定义并入配置。"
+          ],
+          "evidence": [
+            "ev-plugin-manifest"
+          ]
+        },
+        {
+          "id": "seed",
+          "title": "内置插件播种",
+          "body": [
+            "seedBundledOfficialPlugins 从文件系统或 SEA 资产读取插件（sha256 校验）写入 storage/cache/zcode-plugins-official/<name>/<version>/，带播种 marker 与文件锁；注释记录了两个教训——不能在 seed 阶段过滤\"已卸载\"插件（否则恢复功能失去数据源），且全部插件共享同一 15 秒锁预算（否则成组遗留锁会让启动同步冻结 N×15 秒）。一个残缺插件只拒绝自身写缓存并回退旧缓存，不再炸掉会话恢复。"
+          ],
+          "evidence": [
+            "ev-plugin-seed"
+          ]
+        },
+        {
+          "id": "lifecycle",
+          "title": "抑制、恢复与孤立插件",
+          "body": [
+            "用户\"卸载\"内置插件写 user config 的 suppressedBuiltins；发现层按 id 过滤不重播种（Restorable Builtin），恢复动作清除标记并立即重新播种。个人来源被删除后，已安装插件目录与数据保留、仍可用可卸载（Orphaned Installed Plugin），来源重新添加后恢复目录关联——CONTEXT.md 词汇表逐项对应代码实现。"
+          ]
+        },
+        {
+          "id": "marketplace",
+          "title": "市场与安装事务",
+          "body": [
+            "官方市场合并分片：bundled-marketplace.json + cdn-marketplace.json → marketplace.json，同名以 CDN 为准且不删内置缓存；CDN zip 源强制 sha256。installMarketplacePlugin 解析依赖闭包 → 原子目录激活 → 失败回滚 → installed.json 持久化；市场来源支持 url/github/git/npm/file/directory 六种。"
+          ]
+        }
+      ],
+      "principle": [
+        "目录缓存是不可变产品资产，运行时态（抑制/启停）只存用户配置——\"恢复内置插件\"因此是纯数据操作，不需要重新分发。",
+        "安装是事务：依赖闭包解析、原子激活、失败回滚、持久化四步，配合文件锁与 sha256 校验。"
+      ],
+      "limits": [
+        "三方插件 hooks 默认放行执行——源码注释自认放弃了\"仅官方可执行 hook\"的信任边界，依赖用户对插件的信任。",
+        "插件生态的安全审查不在本仓库范围内。"
+      ],
+      "evidence": [
+        "ev-plugin-manifest",
+        "ev-plugin-seed"
+      ]
+    },
+    {
+      "id": "bash-exec",
+      "nav_title": "命令执行",
+      "title": "Bash 执行的三层超时、输出预算与跨平台",
+      "question": "命令执行如何保证可控：超时、输出、进程树与三个操作系统？",
+      "answer": "Bash 工具经 ExecutionPort 到 NodeExecutionAdapter：普通 child_process.spawn，POSIX 下 detached 独立进程组、Windows 保持非 detached 交给 taskkill /T。超时三层：工具策略默认 120s/上限 600s（env 可覆盖）→ executor 的 ToolDeadline（cleanupGrace 6s）→ adapter 默认 300s 到点 requestStop。输出双层预算：core 30KB artifact 策略（超限全量落盘、模型收 tail 预览），adapter 端 30KB/上限 150KB 截断；后台任务输出始终落盘。必须指出：这里没有内核沙箱——dangerouslyDisableSandbox 字段全仓无行为消费者。",
+      "steps": [
+        {
+          "id": "spawn",
+          "title": "spawn 与进程组",
+          "body": [
+            "spawn 时注入清洗过的环境（去掉 NODE_ENV/代理变量避免泄漏进 Bash 工具）、workspaceIdentity 身份隔离 env；detached 注释明言动机：agent 可能再派生 runtime/MCP 子进程，独立进程组才能按树回收。进程树终止：POSIX 用进程组 -pid 发 SIGTERM/SIGKILL，Windows 用 taskkill /pid X /T /F；MCP 子进程另有 Windows Job Object 原生方案。"
+          ],
+          "evidence": [
+            "ev-spawn"
+          ]
+        },
+        {
+          "id": "timeout",
+          "title": "三层超时",
+          "body": [
+            "策略层 resolveBashTimeoutMs = min(input || 120s 默认, 600s 上限)，BASH_DEFAULT_TIMEOUT_MS/BASH_MAX_TIMEOUT_MS 可覆盖；executor 层 ToolDeadline 可暂停（审批等待时暂停计时）、cleanupGraceMs=6s 给清理钩子；adapter 层默认 300s 到点 requestStop(\"timeout\")。"
+          ],
+          "evidence": [
+            "ev-bash-timeout"
+          ]
+        },
+        {
+          "id": "output",
+          "title": "输出预算与落盘",
+          "body": [
+            "core 侧 MAX_INLINE_OUTPUT_BYTES=30000，resultBudget maxModelBytes 30000 + artifact 策略 + session 保留——超限全量写工件、模型收 tail 预览；adapter 侧 BASH_MAX_OUTPUT_LENGTH 默认 30000 上限 150000。后台任务 persistOutput:\"always\"，供 TaskOutput 消费。"
+          ]
+        },
+        {
+          "id": "background",
+          "title": "后台任务",
+          "body": [
+            "显式 run_in_background 或超时自动转后台（auto_on_timeout；sleep 命令无资格、闲时回合禁止后台）。后台化后注册 runtime task、发 BackgroundTaskStarted 事件；TaskOutput/TaskStop 读写任务状态；完成通知走 runtime 命令队列回流会话。"
+          ]
+        },
+        {
+          "id": "platform",
+          "title": "跨平台细节",
+          "body": [
+            "Windows 下 .cmd/.bat 强制经 cmd.exe /d /s /c 执行；shell 探测区分 posix-bash（bash -c -l）与 Git Bash（保留系统 find，不覆盖用户定义）；嵌入式搜索 prelude 只在 posix/git-bash 注入。AGENTS.md 要求终端交互基于能力检测而非假设固定特性。"
+          ]
+        }
+      ],
+      "principle": [
+        "超时/预算的分层让不同层关注不同事：策略层管用户意图，executor 管审批暂停与清理，adapter 管进程事实。",
+        "身份与路径分离：workspaceIdentity 用于身份隔离与去重，workspacePath 只用于文件操作与 cwd。"
+      ],
+      "limits": [
+        "无沙箱是本研读的结论性判断：dangerouslyDisableSandbox 仅是 schema 声明/输出回显字段，全仓 grep 无行为消费者，exec adapter 注释直言\"sandbox 撤除后准备阶段只剩 shell snapshot\"；不排除历史实现已移除。",
+        "隔离实际依赖权限审批与规则（见权限机制），Bash 的风险等级为 high、needsApproval=true。"
+      ],
+      "evidence": [
+        "ev-spawn",
+        "ev-bash-timeout"
+      ]
+    },
+    {
+      "id": "ops",
+      "nav_title": "工程治理",
+      "title": "架构检查、发行打包与遥测",
+      "question": "约 95 万行的 monorepo 如何自保工程质量与可发布性？",
+      "answer": "治理是可执行命令而非 wiki：architecture-check 强制循环依赖、单文件 400 行（契约 300）、contract 公开方法 ≤12、分层方向（低层不得 import 高层）、domain 层禁止 IO、managed 模块必须 module.ts+contract.ts、跨模块只能走公开入口，存量违规靠 baseline 指纹豁免。发行有两条线：build-zcode 组装 CLI/TUI/server/web 的统一发行包（runner 分流 --web），桌面用 tsup+vite+electron-builder 并做 asar 闭包校验与体积审计。遥测用 OpenTelemetry OTLP（trace 采样 0.1、metric DELTA），未配置 endpoint 时完全不加载 SDK。",
+      "steps": [
+        {
+          "id": "arch-check",
+          "title": "架构检查器",
+          "body": [
+            "scripts/architecture/index.mjs 实现九类检查：forbidCycles、maxFileLines=400（契约 300）、lint-disable 计数、contract.ts 公开方法 ≤12（TS AST 计数）、layer-direction、domain-io（禁 node:fs/net/child_process/fetch/setTimeout）、missing-module-artifact（managed 模块必须 module.ts+contract.ts）、deep-import（只能走公开入口）、ui-implementation-import；--changed 只看变更文件反向依赖闭包；baseline sha256 指纹豁免存量。"
+          ],
+          "evidence": [
+            "ev-archcheck"
+          ]
+        },
+        {
+          "id": "policy-state",
+          "title": "policy 的覆盖现状",
+          "body": [
+            "architecture-policy.yaml 声明了模块清单与 global 阈值，但多数模块 managed:false——目前只有 storage 是 managed 模块（domain/app/adapters 三层）。治理框架已就位但分层约束对多数包尚未生效，exceptions 清单为空。"
+          ]
+        },
+        {
+          "id": "dist",
+          "title": "发行包组装",
+          "body": [
+            "build-zcode.mjs 依次构建 @zcode/cli、@zcode/server、@zcode/web，组装 dist/zcode/.work/zcode/（web/ 静态资源、server/entry-http.js、agent/zcode.cjs+provider、TUI runtime 与原生库、bin/zcode.mjs runner），产出 tar.gz+sha256.txt+latest.json+install.sh；安装脚本默认装到 ~/.zcode/runtime 并在 ~/.local/bin 创建 zcode。"
+          ],
+          "evidence": [
+            "ev-runner-web"
+          ]
+        },
+        {
+          "id": "desktop-build",
+          "title": "桌面打包",
+          "body": [
+            "tsup 产出 main/preload/host/scheduler 四个 bundle（workspace 包内联，undici/ssh2/node-pty external），vite 构建 renderer，electron-builder 三平台打包；afterPack 用 asar 扫描补齐缺失 runtime modules 后 repack；产物做 asar 闭包机械校验与体积审计。Agent 本体另有 V8 字节码构建路径。"
+          ]
+        },
+        {
+          "id": "telemetry",
+          "title": "OTLP 遥测",
+          "body": [
+            "telemetry 包动态加载 OTel SDK：OTLP HTTP 导出器 GZIP 压缩、trace 批处理（100/批、队列 2000、5s）、采样 ParentBased+0.1；metric DELTA temporality（注释：CLI 进程短生命周期，须避免累积语义冲突）、显式直方图桶与基数上限 250。身份是匿名 deviceMid；OTEL_EXPORTER_OTLP_* 未配置或显式关闭时完全不初始化。"
+          ]
+        }
+      ],
+      "principle": [
+        "AGENTS.md 是给 AI 贡献者的宪法：spec 先行、测试证明结果、I/O 收敛、单一状态所有者——本仓库的治理对象首先是用 Agent 写代码的 Agent。",
+        "治理可执行化：规则进 CI 命令（verify:pre-push = lint + architecture:check --changed），而非文档约定。"
+      ],
+      "limits": [
+        "managed:false 占多数意味着分层检查对多数模块是空转；治理的实效随 policy 收紧而变化。",
+        "遥测的默认采样与端点为代码事实，生产配置可能不同。"
+      ],
+      "evidence": [
+        "ev-archcheck",
+        "ev-runner-web"
+      ]
+    },
+    {
+      "id": "ui-render",
+      "nav_title": "前端渲染",
+      "title": "三个前端如何共享同一份会话流",
+      "question": "TUI、Web、桌面 Renderer 如何各自呈现同一个会话？",
+      "answer": "三个前端消费同一协议但用两种投影：TUI 是 React 19 + OpenTUI 自定义渲染器（30fps 帧循环、scrollbox viewport 裁剪、粘底滚动），业务状态全在 core，TUI 只保留 useState 镜像与临时交互态，事件 reducer 是纯函数；Web/Desktop Renderer 用 V4 投影存储——snapshot 整体替换、delta 顺序应用、断档携水位重订阅——把会话渲染成虚拟化时间线。权限审批/AskUserQuestion/计划确认在协议层都是 pendingInteractions，客户端只做呈现与 resolveInteraction 应答。",
+      "steps": [
+        {
+          "id": "tui",
+          "title": "OpenTUI 渲染器",
+          "body": [
+            "createCliRenderer 配置 targetFps:30、useMouse、禁用默认 Ctrl-C 退出（SIGPIPE 保护）；FRAME 事件在首帧原生输出后才挂载真正的 App——\"No runtime work can block the first paint\"。transcript 用 scrollbox + stickyScroll + viewportCulling 处理长会话。OpenTUI 内部的差量/双缓冲实现是预编译二进制，仓库不可见。"
+          ],
+          "evidence": [
+            "ev-tui-renderer"
+          ]
+        },
+        {
+          "id": "tui-state",
+          "title": "TUI 的镜像状态与事件闸门",
+          "body": [
+            "TuiOptions 注入一切后端能力（submitPrompt/subscribeSessionEvents/setMode/listModelOptions…）；messages/draft/busy/mode/approvalQueue 全是 useState 镜像，数据源是 SessionEvent 与 submitPrompt 结果。常驻订阅与每回合投递由 2048 条 id 记忆窗去重；mode 切换乐观更新失败回滚，model 选择不落 TUI 权威态（随 prompt 提交，展示值由 ModelSelected 事件回写）。"
+          ],
+          "evidence": [
+            "ev-tui-events"
+          ]
+        },
+        {
+          "id": "v4-projection",
+          "title": "V4 投影与行模型",
+          "body": [
+            "projection store 是只读投影，唯一写入方是订阅推送：snapshot 整体替换、delta 仅在 fromSeq 衔接时应用，断档携水位重订阅（重试 250ms/1s/3s）。行模型把会话建模为 userInput/assistantText/reasoning/toolCall/artifact/subagent 行，文本行带 streaming/complete/interrupted 状态；React 用 useSyncExternalStore 订阅，时间线虚拟化 + live tail 防跳动。"
+          ],
+          "evidence": [
+            "ev-projection"
+          ]
+        },
+        {
+          "id": "interactions",
+          "title": "交互请求的统一收口",
+          "body": [
+            "会话 snapshot 的 pendingInteractions 分 permission/userInput/workspaceHookReview 三类；权限弹窗渲染选项并 resolveInteraction({optionId})，AskUserQuestion 渲染问答表单（草稿按 requestId 存、snapshot 为权威清理），ExitPlanMode 复用问答组件但 interaction=plan_approval（空答案即拒绝、裸 Enter 才能提交）。TUI 侧对应 ApprovalPanel：审批队列非空时替换整个输入区并吞掉全部按键，Esc 即 deny。"
+          ],
+          "evidence": [
+            "ev-interactions"
+          ]
+        },
+        {
+          "id": "i18n",
+          "title": "自研 i18n 与主题",
+          "body": [
+            "轻量 IntlProvider：静态字典 + {key} 占位符替换，仅 zh-CN/en-US 双语（各约 6000 行），locale 经 localStorage+settingService+跨窗口 broadcast 三层同步。主题经 documentElement class 切换（dark/zai-light/zai-dark），DESIGN.md 的 text-ui-* 刻度实现为 Tailwind v4 @theme 里的 calc() 变量，全部派生自 --ui-font-size。"
+          ],
+          "evidence": [
+            "ev-i18n"
+          ]
+        }
+      ],
+      "principle": [
+        "\"不同客户端只是呈现与传输适配层\"（AGENTS.md）：交互流程（确认/提问/计划审批）在协议层建模为 interaction 请求，而不是写死在某个前端。",
+        "UI 状态皆为镜像、权威在 core/session：这使 Web/Desktop/TUI 三个前端可以独立演进而不分裂会话事实。"
+      ],
+      "limits": [
+        "OpenTUI 内部渲染机制（差量提交）是推断，预编译依赖不可见。",
+        "时间线虚拟化与终态聚合的全部细节未逐行核实。"
+      ],
+      "evidence": [
+        "ev-tui-renderer",
+        "ev-tui-events",
+        "ev-projection",
+        "ev-interactions",
+        "ev-i18n"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-runner-web",
+      "label": "发行入口 --web 分流",
+      "kind": "implementation",
+      "path": "scripts/zcode-distribution/runner.mjs",
+      "lines": [
+        256,
+        267
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/scripts/zcode-distribution/runner.mjs#L256-L267",
+      "excerpt": "  } else if (argv[0] === \"--web\") {\n    const options = parseArgs(argv.slice(1));\n    if (options.command === \"help\") console.log(usage());\n    else if (options.command === \"version\") console.log(version);\n    else await serve(options);\n  } else {\n    if (argv.length === 1 && [\"--help\", \"-h\"].includes(argv[0])) {\n      console.log(\"Web mode: zcode --web [options] (zcode --web --help for details)\\n\");\n    }\n    // CLI 自启动子进程依赖 argv[1]；统一指向真正的 Agent 入口，保留 TTY 与所有原始参数。\n    process.argv[1] = agentEntry;\n    await import(pathToFileURL(agentEntry).href);",
+      "supports": "README 宣称的\"统一 zcode 命令、--web 启动 Web\"的确切实现位置：分流在发行包 runner 而非 CLI 包内；serve() 会 spawn server/entry-http.js 并注入静态目录与令牌。"
+    },
+    {
+      "id": "ev-cli-main",
+      "label": "CLI 进程边界",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/cli/src/main.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/cli/src/main.ts",
+      "supports": "main() 清洗运行时环境、判断协议/TUI 模式、协议或 TUI 模式把 console 引到 stderr（stdout 是严格协议帧通道/TUI 专属）。结论来自子代理逐行阅读，主笔未复核原文摘录。"
+    },
+    {
+      "id": "ev-cli-run",
+      "label": "命令分发 switch",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/cli/src/run.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/cli/src/run.ts",
+      "supports": "run() 解析全局参数后分发：-p/--target 进 headless，app-server|agent-server 进协议服务器，默认命令名 tui（无参数进 TUI）。结论来自子代理逐行阅读（run.ts:486-575）。"
+    },
+    {
+      "id": "ev-create-app",
+      "label": "组合根 createApp",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/bootstrap/src/app/create-app.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/app/create-app.ts",
+      "supports": "五层合并配置、打开 SQLite 会话库、扫描子代理/插件/技能，构造 AgentRuntime 并注入端口（约 1292 行的组合根）。结论来自子代理逐行阅读（create-app.ts:146-797）。"
+    },
+    {
+      "id": "ev-runtime-tools",
+      "label": "运行时工具装配",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/helpers/runtime-tools.ts",
+      "lines": [
+        33,
+        44
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/helpers/runtime-tools.ts#L33-L44",
+      "excerpt": "export function initializeRuntimeTooling(\n  runtime: AgentRuntimeInternal,\n  deps: AgentRuntimeDeps,\n  sessionId: SessionId,\n): { executor: ToolExecutor; hookRunner?: HookRunner } {\n  registerRuntimeBuiltInTools(runtime, deps);\n  const hookRunner = createRuntimeHookRunner(runtime, deps, sessionId);\n  return {\n    executor: deps.toolExecutor ?? createRuntimeToolExecutor(runtime, deps, hookRunner),\n    hookRunner,\n  };\n}",
+      "supports": "AgentRuntime 的工具/钩子/执行器在装配点一次性收口；下游 registerRuntimeBuiltInTools（46-86 行）按端口与灰度门控决定每个内置工具是否注册。"
+    },
+    {
+      "id": "ev-command-queue",
+      "label": "runtime 命令队列类型",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/command-queue.ts",
+      "lines": [
+        10,
+        28
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/command-queue.ts#L10-L28",
+      "excerpt": "export type RuntimeCommandPriority = \"now\" | \"next\" | \"later\";\nexport type RuntimeCommandMode =\n  | \"prompt\"\n  | \"target-continuation\"\n  | \"target-continuation-loop\"\n  | \"task-notification\"\n  | \"subagent-message\"\n  | \"control-only-turn\";\nexport type RuntimeCommandId = string & {\n  readonly __runtimeCommandId: unique symbol;\n};\n\nexport interface RuntimeCommandBase {\n  readonly createdAt: Date;\n  readonly id: RuntimeCommandId;\n  readonly mode: RuntimeCommandMode;\n  readonly priority: RuntimeCommandPriority;\n  readonly traceContext: TraceContext;\n}",
+      "supports": "回合准入与排队的统一命令模型：用户输入、后台通知、子代理消息都进同一条队列，优先级 now/next/later 决定插队语义。"
+    },
+    {
+      "id": "ev-turn-orchestrate",
+      "label": "executeTurn 编排",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/turn.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/turn.ts",
+      "supports": "回合编排顺序：创建 turnModel(:189) → Context 初始化(:215) → SessionStart 钩子(:227) → /compact /rewind 分流(:240) → 发 TurnStarted(:304) → UserPromptSubmit(:362) → 持久化用户消息(:477)。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-turn-loop",
+      "label": "回合主循环开头",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/turn-loop.ts",
+      "lines": [
+        47,
+        56
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/turn-loop.ts#L47-L56",
+      "excerpt": "    while (true) {\n      throwIfTurnAborted(state.turnAbortSignal);\n      const outputTokenRecoveryActive = state.turnRequestState.outputTokenContinuationCount > 0;\n      // guide 只允许由完整 tool result batch 设置这个一次性诊断；普通 queue 不在\n      // model roundtrip 起点消费，避免把未来 turn 错并入当前 product turn。\n      const drainedSteerForNextRequest = state.drainedSteerForNextRequest;\n      state.drainedSteerForNextRequest = undefined;\n\n      if (state.modelStepCount > 0 && !outputTokenRecoveryActive) {\n        const drainedRuntimeCommands = await this.drainPendingRuntimeCommandsForActiveLoop();",
+      "supports": "主循环是显式 while(true)：没有轮数计数硬停止，循环顶部只检查取消并 drain 排队插话/后台结果。退出由模型自然结束、取消、不可恢复错误等明确条件决定。"
+    },
+    {
+      "id": "ev-turn-compact-hook",
+      "label": "每轮 microcompact 调用",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/turn-loop.ts",
+      "lines": [
+        67,
+        74
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/turn-loop.ts#L67-L74",
+      "excerpt": "    const compactPhase =\n      state.modelStepCount === 0 ? CompactPhase.PreRequest : CompactPhase.MidTurn;\n    await this.microcompactIfNeeded(state.turnTraceContext, state.events, state.turnAbortSignal, {\n      model: state.model,\n      modelStepIndex: state.modelStepCount,\n      phase: compactPhase,\n      turnRequestState: state.turnRequestState,\n    });",
+      "supports": "每个模型步请求前都会评估 microcompact（首轮 PreRequest、中途 MidTurn），随后（77-102 行）再评估 autoCompact 与 rapid-refill 熔断。"
+    },
+    {
+      "id": "ev-turn-preparation",
+      "label": "MCP 初始化与工具面组装",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/turn-loop.ts",
+      "lines": [
+        105,
+        118
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/turn-loop.ts#L105-L118",
+      "excerpt": "    const finishMcp = beginLocalTurnPreparation(state.turnTraceContext, \"mcp\");\n    await this.initializeMcp(state.turnTraceContext);\n    finishMcp();\n    throwIfTurnAborted(state.turnAbortSignal);\n    const finishTools = beginLocalTurnPreparation(state.turnTraceContext, \"tools\");\n    const turnDisallowedTools = buildTurnDisallowedTools(state);\n    // automation 派发到已 active 会话或重试恢复时，入口 metadata 可能没有带到\n    // loop state；但 queryId 仍是 automation-*。provider 请求边界必须按 queryId 再硬过滤\n    // automation 写工具，否则模型会先看到并创建、修改或删除任务定义。\n    const tools = state.automationCreateLimitReached\n      ? []\n      : turnDisallowedTools\n        ? this.getTools(state.model).filter((tool) => !turnDisallowedTools.has(tool.name))\n        : this.getTools(state.model);",
+      "supports": "每轮循环在模型请求前初始化 MCP、按 disallowlist 过滤工具面；automation 派发轮按 queryId 再硬过滤写工具，防止模型看到并改写任务定义——工具面是每轮动态投影而非静态注入。"
+    },
+    {
+      "id": "ev-model-stream",
+      "label": "流式事件消费",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/model.ts",
+      "lines": [
+        228,
+        243
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/model.ts#L228-L243",
+      "excerpt": "  const modelStream = runWithModelInvocationContext(modelInvocationContext, () =>\n    model.streamText(modelRequest),\n  );\n  finishAssembly();\n  try {\n    for await (const event of modelStream) {\n      switch (event.type) {\n        case \"start\": {\n          await enqueueStreamingEvent({\n            assistantMessageId: options.assistantMessageId,\n            delta: \"\",\n            done: false,\n            kind: \"start\",\n          });\n          break;\n        }",
+      "supports": "模型请求以 streamText 异步可迭代形式消费；每个事件经 enqueueStreamingEvent 的有序写队列持久化为 ModelStreaming 事件（高水位 128 条背压），流式与持久化同构。"
+    },
+    {
+      "id": "ev-tools-schedule",
+      "label": "工具调度",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/tool/scheduler.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/tool/scheduler.ts",
+      "supports": "ToolScheduler 从工具元数据推导依赖并拓扑分组并行执行，DEFAULT_MAX_CONCURRENCY=10（scheduler.ts:34/48）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-tool-normalize",
+      "label": "调用管线：归一化在钩子之前",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts",
+      "lines": [
+        204,
+        230
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts#L204-L230",
+      "excerpt": "  // 归一化：把模型发出的入参换成「将要发生的执行事实」。位置刻意在 hook **之前**——此后\n  // hook、权限规则、确认窗载荷、prepareApproval 与 handler 读的都是同一份输入，于是\n  // 「策略看得到真正的脚本」「跨版本可见」「确认与执行同字节」三件事一次到位。\n  if (entry.resolveInput) {\n    const workingDirectory = deps.getWorkingDirectory?.();\n    const resolution = await entry.resolveInput(executionInput, {\n      ...(workingDirectory === undefined ? {} : { workingDirectory }),\n      runtimeTaskRegistry: deps.runtimeTaskRegistry,\n      ...(deps.dynamicWorkflowRunPort === undefined\n        ? {}\n        : { dynamicWorkflowRunPort: deps.dynamicWorkflowRunPort }),\n      ...(deps.modelCatalogPort === undefined ? {} : { modelCatalogPort: deps.modelCatalogPort }),\n      sessionId: deps.sessionId,\n    });\n    if (isToolHandlerFailure(resolution)) {\n      // 与 validateInput 同一条生命周期出口：解析不出来是模型该立刻拿回去修的东西，\n      // 不该先弹一次注定失败的确认窗。\n      const result = createErrorResult(\n        canonicalToolCall,\n        createToolHandlerFailureError(canonicalToolCall, resolution),\n      );\n      await emitToolCallError(deps, canonicalToolCall.id, traceContext, turnId, result.error);\n      telemetry?.finishFailed(\"validation\", \"parse\", result.error);\n      return result;\n    }\n    executionInput = resolution.input;\n  }",
+      "supports": "单调用管线中 resolveInput 归一化的位置与理由：此后钩子、权限规则、确认窗与 handler 读同一份输入；解析失败在钩子/权限之前早退，不弹注定失败的确认窗。"
+    },
+    {
+      "id": "ev-tool-artifact",
+      "label": "结果预算：工件与截断",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/tool/executor/result-serialization.ts",
+      "lines": [
+        178,
+        201
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/tool/executor/result-serialization.ts#L178-L201",
+      "excerpt": "  if (effectiveBudget.strategy === \"artifact\" && effectiveBudget.artifact?.enabled === true) {\n    if (artifact && resolvedArtifactPath) {\n      const persistedOutputContent = formatPersistedOutputContent({\n        content,\n        entry,\n        originalBytes,\n        output,\n        persistedPath: resolvedArtifactPath,\n      });\n      const persistedContent = stringifyModelContentForSerialization(persistedOutputContent);\n      return {\n        content: persistedContent,\n        modelContent: persistedOutputContent,\n        originalBytes,\n        returnedBytes: Buffer.byteLength(persistedContent, \"utf8\"),\n        truncated: true,\n        budgetStrategy: effectiveBudget.strategy,\n        artifactPath: resolvedArtifactPath,\n      };\n    }\n  }\n\n  const artifactHint = resolvedArtifactPath ? `artifactPath=${resolvedArtifactPath}, ` : \"\";\n  const suffix = `\\n\\n[Tool output truncated by resultBudget: ${artifactHint}originalBytes=${originalBytes}, maxModelBytes=${maxModelBytes}, strategy=${effectiveBudget.strategy}]`;",
+      "supports": "超预算结果的两条路径：artifact 策略全量落盘、模型只收持久化预览；否则截断并追加带原始字节数与策略的标记。大结果不回灌上下文由机制保证。"
+    },
+    {
+      "id": "ev-perm-order",
+      "label": "权限判定顺序",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/permission/service.ts",
+      "lines": [
+        130,
+        156
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/permission/service.ts#L130-L156",
+      "excerpt": "    // 声明 alwaysAsk 的工具必须经过用户确认，不能被权限模式的放行分支绕过。\n    if (capability.alwaysAsk) {\n      return this.checkAlwaysAsk(context, capability, projectRules, rulePolicy);\n    }\n\n    const planEnabled = context.planEnabled ?? context.mode === \"plan\";\n    if (context.mode === \"yolo\" && !planEnabled) {\n      return this.allow(context, capability, \"mode.yolo\", \"Yolo mode bypasses permission prompts\");\n    }\n\n    if (context.mode === \"auto\") {\n      return this.deny(\n        context,\n        capability,\n        \"mode.auto.unimplemented\",\n        \"Auto mode is reserved but not implemented yet\",\n      );\n    }\n\n    if (this.config.disallowedTools.has(context.toolName)) {\n      return this.deny(\n        context,\n        capability,\n        \"rule.disallowedTools\",\n        `Tool ${context.toolName} is explicitly disallowed`,\n      );\n    }",
+      "supports": "checkPermission 的判定顺序即语义优先级：alwaysAsk 在 yolo 直通之前（注释明言不可绕过），auto 模式保留未实现命中即 deny，disallowedTools 随后。"
+    },
+    {
+      "id": "ev-perm-race",
+      "label": "审批竞速及其修复注释",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts",
+      "lines": [
+        179,
+        184
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts#L179-L184",
+      "excerpt": "    // 这里曾经串行 `await runPermissionRequestHooks(...)`，\n    // broker 要等 hook 链返回才启动。同步 PermissionRequest hook（外部审批桥接）阻塞期间，\n    // 确认窗已经渲染（上面的 emitPermissionRequested），但应答 deferred 尚未注册，用户的\n    // 每一次点击都被 resolveInteraction 按幂等语义静默丢弃——确认窗永久死亡。\n    // 修法：hook 链与 broker 并发竞速，先到的决定生效，败者被 abort 且不被等待。\n    const raceOutcome = await racePermissionResponders({",
+      "supports": "需要审批时 PermissionBroker（确认窗）与 PermissionRequest 钩子链并发竞速；注释记录了串行实现导致确认窗永久死亡的真实缺陷与修复依据。"
+    },
+    {
+      "id": "ev-compact-const",
+      "label": "压缩预算常量",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/compact/policy.ts",
+      "lines": [
+        6,
+        14
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/compact/policy.ts#L6-L14",
+      "excerpt": "export const DEFAULT_COMPACT_CONTEXT_WINDOW = 200_000;\n// 正常请求默认输出已收敛到 32K，auto compact 必须预留同一目标；\n// 否则请求预算和压缩窗口会继续按两套常量计算。\nexport const DEFAULT_AUTOCOMPACT_OUTPUT_RESERVE_TOKENS = 32_000;\nconst PREFLIGHT_AUTOCOMPACT_OUTPUT_RESERVE_TOKENS = 21_000;\nexport const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000;\nexport const AUTOCOMPACT_BUFFER_TOKENS = 13_000;\nexport const DEFAULT_AUTOCOMPACT_THRESHOLD_PERCENT = 100;\nexport const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3;",
+      "supports": "压缩阈值的核心常量：默认窗口 200K、输出预留收敛到 21K（preflight）、buffer 13K、摘要上限 20K、连续失败熔断 3 次；注释明言请求预算与压缩窗口必须共用一套常量。"
+    },
+    {
+      "id": "ev-compact-formula",
+      "label": "阈值公式",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/compact/policy.ts",
+      "lines": [
+        67,
+        88
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/compact/policy.ts#L67-L88",
+      "excerpt": "export function getEffectiveContextWindowSize(config: AutoCompactPolicyConfig = {}): number {\n  const contextWindow = positiveInt(config.contextWindow) ?? DEFAULT_COMPACT_CONTEXT_WINDOW;\n  // provider 的 context window 是 input + output 共享窗口；自动压缩只能让出输入侧，\n  // 因此阈值分母必须先扣掉当前模型允许的 output token，而不是继续吃完整 contextWindow。\n  const reserve = Math.min(getAutoCompactOutputReserveTokens(config), contextWindow);\n  return Math.max(0, contextWindow - reserve);\n}\n\nexport function getAutoCompactOutputReserveTokens(config: AutoCompactPolicyConfig = {}): number {\n  const maxOutputTokens = positiveInt(config.maxOutputTokens);\n  // 旧 legacy 分支为完整模型输出预留窗口，既过早压缩又要求远端选择；现在统一保留至多 21K。\n  return Math.min(\n    maxOutputTokens ?? DEFAULT_AUTOCOMPACT_OUTPUT_RESERVE_TOKENS,\n    PREFLIGHT_AUTOCOMPACT_OUTPUT_RESERVE_TOKENS,\n  );\n}\n\nexport function getAutoCompactThreshold(config: AutoCompactPolicyConfig = {}): number {\n  const effectiveContextWindow = getEffectiveContextWindowSize(config);\n  const buffer = positiveInt(config.bufferTokens) ?? AUTOCOMPACT_BUFFER_TOKENS;\n  return Math.max(0, effectiveContextWindow - buffer);\n}",
+      "supports": "阈值计算：有效窗口 = contextWindow − min(maxOutputTokens, 21K)；阈值 = 有效窗口 − 13K。200K 窗口即约 166K 触发 auto compact。"
+    },
+    {
+      "id": "ev-compact-active",
+      "label": "全量 compact 编排",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/compact-active.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/compact-active.ts",
+      "supports": "compactModel 默认取会话当前模型（:174-178，非独立摘要模型）；摘要输出上限 min(模型上限,20K)（:716-725）；完成后 replaceMessages 并清 readFileState（:615-625）；prompt-too-long 逐级降级重试 3 次。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-agentsmd-memory",
+      "label": "AGENTS.md 与记忆索引注入",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/context/sections/request-user-context.ts",
+      "lines": [
+        63,
+        86
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/context/sections/request-user-context.ts#L63-L86",
+      "excerpt": "  return [\n    // 聚合字段标题不能绑定到 AGENTS.md，否则仅有 Project Memory 时缺少标题。\n\n    \"# agentsMd\",\n    \"Codebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\",\n    \"\",\n    sections.join(\"\\n\\n\"),\n  ].join(\"\\n\");\n}\n\nfunction buildProjectMemoryIndexContent(\n  memoryRoot: string | undefined,\n  indexContent: string | undefined,\n): string | null {\n  if (!memoryRoot || indexContent === undefined) return null;\n  const formatted = formatProjectMemoryIndexContent(indexContent);\n  if (!formatted) return null;\n\n  return [\n    `Contents of ${join(memoryRoot, \"MEMORY.md\")} (user's auto-memory, persists across conversations):`,\n    \"\",\n    formatted,\n  ].join(\"\\n\");\n}",
+      "supports": "AGENTS.md 以带 OVERRIDE 声明的 # agentsMd 块注入；项目记忆索引 MEMORY.md 以固定标题格式注入为相邻 meta_user 块。"
+    },
+    {
+      "id": "ev-memory",
+      "label": "自动记忆抽取与写权限",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/memory/memory-agent-loop.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/memory/memory-agent-loop.ts",
+      "supports": "后台记忆子代理：同一主模型但最低推理档、输出 ≤5K、最多 5 轮；写权限收敛为 Write/Edit memory 目录内 .md + 只读 Bash + 目录内 rm；敏感路径段黑名单。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-sysreminder",
+      "label": "system-reminder 三类来源",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/system-reminder/source.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/system-reminder/source.ts",
+      "supports": "三类共 30 个 reminder 来源（prefix/persisted/per-request，:20-51）、统一包裹与严格转义防伪造（:73-74, :233-237）、MCS 集合决定可移到 system 侧的来源（:76-86）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-skills-listing",
+      "label": "技能清单注入",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/context/sections/skills.ts",
+      "lines": [
+        39,
+        58
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/context/sections/skills.ts#L39-L58",
+      "excerpt": "function buildSkillsContent(skills: SkillMetadata[], budget: number): string {\n  const lines = [\n    \"The following skills are available for use with the Skill tool:\",\n    \"\",\n  ];\n\n  const sortedSkills = [...skills].sort((a, b) =>\n    skillDisplayName(a).localeCompare(skillDisplayName(b)),\n  );\n  const skillLines = sortedSkills.map((skill) => formatSkillLine(skill, MAX_DESCRIPTION_CHARS));\n  const full = [...lines, ...skillLines].join(\"\\n\");\n  if (full.length <= budget) {\n    return full;\n  }\n\n  const namesOnly = sortedSkills.map(\n    (skill) => `- ${skillDisplayName(skill)}${bareAliasSuffix(skill)} (file: ${skill.path})`,\n  );\n  return [...lines, ...namesOnly].join(\"\\n\");\n}",
+      "supports": "技能清单按字母序注入并带预算退化：全文超预算时退化为纯名字+路径列表，保证元信息永不撑爆上下文。"
+    },
+    {
+      "id": "ev-embedded-search",
+      "label": "嵌入式搜索 prelude",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/adapters/src/exec/embedded-search-prelude.ts",
+      "lines": [
+        34,
+        56
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/adapters/src/exec/embedded-search-prelude.ts#L34-L56",
+      "excerpt": "export function buildEmbeddedSearchPreludeContent(\n  prelude?: ExecutionEmbeddedSearchPrelude,\n  options: EmbeddedSearchPreludeOptions = {},\n): string | undefined {\n  if (prelude?.kind !== \"embedded-search\") return undefined;\n  if (!supportsPosixShellFunctionPrelude(options.shellDialect)) return undefined;\n\n  const backend = normalizeBackendForShell(prelude.backend, options.shellDialect);\n  // Windows 不分发 bfs；Git Bash 必须保留系统 find，不能只因存在 fallback 就覆盖用户定义。\n  const shouldWrapFind = options.shellDialect !== \"git-bash\";\n  const content =\n    prelude.findAndGrepEnabled === false\n      ? []\n      : [\n          ...(shouldWrapFind ? [\"unalias find 2>/dev/null || true\"] : []),\n          \"unalias grep 2>/dev/null || true\",\n          ...(shouldWrapFind ? [createFindFunction(backend)] : []),\n          createGrepFunction(backend),\n        ];\n  const ripgrepFallback = createRipgrepFallback(backend);\n  if (ripgrepFallback) content.push(ripgrepFallback);\n  return content.join(\"\\n\");\n}",
+      "supports": "Bash shell prelude 注入 find()/grep() 函数把搜索路由到打包的 bfs/ugrep（ripgrep 兜底）；Git Bash 保留系统 find、cmd/legacy-shell 不注入——能力检测而非假设。"
+    },
+    {
+      "id": "ev-session-create",
+      "label": "会话落库",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/events.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/events.ts",
+      "supports": "ensureSessionPersisted（:558-660）在首轮落库 session（projectID 由目录派生、title 取首条输入、permission mode）并同步持久化模型选型/shell 快照。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-event-store",
+      "label": "事件存储与投影",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/message-persistence.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/message-persistence.ts",
+      "supports": "事件 append 先落库再通知 sink；rebuildProjection = getEvents + eventReducer.reduce（:385-388）；用户消息持久化含 queue promotion 原子事务（:142-148）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-sqlite-store",
+      "label": "SQLite 会话库",
+      "kind": "implementation",
+      "path": "packages/adapters/src/storage/session-store/sqlite-session-store.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/adapters/src/storage/session-store/sqlite-session-store.ts",
+      "supports": "SessionStorePort 的生产实现是 SqliteSessionStore（:225），默认库路径 ~/.zcode/cli/db/db.sqlite（paths.ts:6-8），bootstrap 启动时 open+migrate。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-rewind",
+      "label": "文件检查点与 rewind",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/helpers/rewind.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/helpers/rewind.ts",
+      "supports": "Edit/Write 成功后从工具输出提取 filePath/structuredPatch/originalFile 序列化为 WorkspaceCheckpointArtifact 并发 CheckpointCreated（tools.ts:169-251 调用；rewind.ts:38-81 构建；:83-135 按 checkpointId 或消息选择）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-agent-tool",
+      "label": "Agent/Task 工具",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/tool/handlers/agent.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/tool/handlers/agent.ts",
+      "supports": "Agent 工具 handler 调 subagentPort.launch（:174-222），concurrentSafe:true（:231）；Task 是 providerVisible:false 的兼容别名（:287-300）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-subagent-child",
+      "label": "child runtime 创建",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/subagent.ts",
+      "lines": [
+        239,
+        244
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/subagent.ts#L239-L244",
+      "excerpt": "      const childRuntime = new AgentRuntime(\n        request.sessionId,\n        {\n          // 旧 plan 枚举不包含基础权限；拆分后继承完整状态，避免被构造器回退成 build。\n          mode: childMode === \"plan\" ? this.config.mode : childMode,\n          planEnabled: childMode === \"plan\",",
+      "supports": "子代理是全新的 AgentRuntime 实例（独立会话身份），权限模式继承父的完整状态而非回退。"
+    },
+    {
+      "id": "ev-subagent-isolation",
+      "label": "子代理隔离边界",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/subagent.ts",
+      "lines": [
+        262,
+        271
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/subagent.ts#L262-L271",
+      "excerpt": "          // child 只复用父 runtime 已解析的 instructions snapshot；Project Context 仍不继承。\n          currentDate: this.contextSourceSnapshot?.currentDate ?? this.config.currentDate,\n          subagentContext: {\n            agentPrompt: agentPrompt ?? \"\",\n            ...(agentsMdInstructions ? { userInstructions: agentsMdInstructions } : {}),\n          },\n          agentName: `zcode-${request.agentType}`,\n          maxTurns: request.maxTurns ?? this.config.subagents?.maxTurns ?? 4,\n          parentSessionId: this.sessionId,\n          taskType: \"subagent_child\",",
+      "supports": "隔离边界的精确事实：子代理只复用父已解析的指令快照（不继承 Project Context）、maxTurns 默认 4（仅子代理 runner 强制）、taskType=subagent_child、父会话 id 作 parentSessionId。"
+    },
+    {
+      "id": "ev-sub-lifecycle",
+      "label": "子代理后台通知管线",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/background-notifications.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/background-notifications.ts",
+      "supports": "后台子代理/任务完成通知入 runtime 命令队列（mode=task-notification、priority=next、写 durable admission 账本），排空时合成一条 model-only 消息进入父会话下一轮（:10-83, :166-218）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-dwf-harness",
+      "label": "dwf 沙箱 harness 设计注释",
+      "kind": "docs",
+      "path": "apps/zcode-cli/packages/dynamic-workflow-runtime/src/harness.ts",
+      "lines": [
+        1,
+        28
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/dynamic-workflow-runtime/src/harness.ts#L1-L28",
+      "excerpt": "/**\n * 父进程 harness（Boundary A 的宿主侧 + 沙箱进程编排）。\n *\n * 职责：把一份 workflow 脚本（或已 lowered 的函数体）在受控子进程里跑起来，用 NDJSON 桥接\n * 子进程的 `__host.*` 调用到一个 {@link WorkflowEngine} 实例，最终返回引擎的 {@link RunSettlement}。\n * 本包**只**依赖 `@zcode/dynamic-workflow` 与 node 内建——证明整条管线 app-free 可跑，\n * 绝不 import `@zcode/core`/`@zcode/contracts`/`@zcode/bootstrap`/`@zcode/adapters`。\n *\n * 时序（happy path）：\n *\n *   parent                         child(vm)\n *     │  write <cwd>/.zcode/workflow-runs/<runId>.mjs（payload: lowered+args 内嵌）\n *     │  spawn(node <entry>)\n *     │──────────────────────────▶│  build __host in context\n *     │◀── create-actor(local#1) ──│  createActor 同步返回 local#1\n *     │  map local#1 → ActorId     │\n *     │◀── request ask(local#1) ───│  await __host.ask(...)\n *     │  engine.ask → driver.startAsk … settle\n *     │── response(value) ────────▶│  resolve\n *     │◀────── complete(ok,value) ──│  脚本 return\n *     │  engine.complete(value) → settled=completed\n *\n * 失败/取消：run 的裁决归引擎所有。终结失败（脚本抛错 error-complete、子进程崩溃/非零退出、\n * 墙钟超时、子进程行 JSON 解析失败）都调 `engine.fail(error)`（结算 failed + journal failure_json）；\n * abort 信号是唯一的\"真取消\"，调 `engine.stop(initiator)`（结算 stopped；`signal.reason` 为\n * `\"model\"` 即主代理 TaskStop，`\"interrupted\"` 即宿主 App 关闭时停下自己拥有的 run，否则算用户）。引擎自身的 run 级失败\n * （reportCap/inputHash/unknownActor）同样经 engine.settled 冒出。harness 侧的 first-wins\n * finalize 只管子进程清理（清 timer、关 stdin、kill child），不自造结算。",
+      "supports": "dwf 的完整执行模型（源码设计注释）：脚本写入 .zcode/workflow-runs 后 spawn 独立 node 子进程，NDJSON 桥接 __host.* 到宿主引擎；终结失败与 abort（唯一真取消）的结算语义；runtime 包零业务依赖可独立测试。"
+    },
+    {
+      "id": "ev-ndjson",
+      "label": "NDJSON 传输实现",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/bootstrap/src/zcode-protocol/transport.ts",
+      "lines": [
+        74,
+        95
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/transport.ts#L74-L95",
+      "excerpt": "  send(message: ZCodeProtocolOutgoingMessage): void {\n    if (this.terminal) return;\n    try {\n      this.options.output.write(`${JSON.stringify(message)}\\n`);\n    } catch (error) {\n      this.onError(error instanceof Error ? error : new Error(String(error)));\n    }\n  }\n\n  private readonly onData = (chunk: Buffer | string): void => {\n    if (this.terminal || this.draining) return;\n    this.buffer += typeof chunk === \"string\" ? chunk : chunk.toString(\"utf8\");\n    let newlineIndex = this.buffer.indexOf(\"\\n\");\n    while (newlineIndex >= 0) {\n      const line = this.buffer.slice(0, newlineIndex).trim();\n      this.buffer = this.buffer.slice(newlineIndex + 1);\n      if (line.length > 0) {\n        this.dispatchLine(line);\n      }\n      newlineIndex = this.buffer.indexOf(\"\\n\");\n    }\n  };",
+      "supports": "legacy 协议的物理形态：发送即 JSON+换行；接收按 LF 切帧逐行分发（dispatchLine 内做 zod 校验，解析错误回 -32700/-32600）。"
+    },
+    {
+      "id": "ev-v4-discipline",
+      "label": "V4 包纪律与 wire 版本",
+      "kind": "implementation",
+      "path": "packages/shared/src/zcode-protocol-v4/core.ts",
+      "lines": [
+        1,
+        7
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/shared/src/zcode-protocol-v4/core.ts#L1-L7",
+      "excerpt": "// ZCode Protocol v4 —— 数据模型草稿（未冻结，schema 定型以黄金测试为准）。\n// 本包纪律：只放 schema 类型 + 纯函数，禁止任何运行时/IO/传输逻辑。\nimport { z } from \"zod\";\nimport { VIDEO_INPUT_MAX_BYTES } from \"../zcode-media-policy.js\";\n\n/** V4 物理 wire 协议版本；projection snapshot 继续独立使用 protocolVersion=1。 */\nexport const V4_WIRE_PROTOCOL_VERSION = 3 as const;",
+      "supports": "V4 的定位与工程纪律：数据模型草稿未冻结、schema 包零运行时、wire v3 与 legacy 版本常量并存互不改写。"
+    },
+    {
+      "id": "ev-v4-profiles",
+      "label": "V4 delivery profiles",
+      "kind": "implementation",
+      "path": "packages/shared/src/zcode-protocol-v4/core.ts",
+      "lines": [
+        34,
+        59
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/shared/src/zcode-protocol-v4/core.ts#L34-L59",
+      "excerpt": "export const DELIVERY_PROFILES = {\n  continuous: {\n    desktopOnlyRows: true,\n    flushWindowMs: 30,\n    streamPaths: {\n      text: true,\n      inputText: true,\n      \"output.text\": true,\n      summaryText: true,\n    },\n    streamOutputCapBytes: 262144,\n    toolProgress: false,\n  },\n  replayable: {\n    desktopOnlyRows: false,\n    flushWindowMs: 150,\n    streamPaths: {\n      text: true,\n      inputText: false,\n      \"output.text\": false,\n      summaryText: false,\n    },\n    streamOutputCapBytes: 0,\n    toolProgress: true,\n  },\n} as const satisfies Record<string, DeliveryProfile>;",
+      "supports": "两种推送节奏的精确参数：桌面 continuous 30ms 全量流式（256KiB 上限）；Web/手机 replayable 150ms、只有文本行+工具进度、无流式正文——两种客户端语义由 profile 数据而非分支代码区分。"
+    },
+    {
+      "id": "ev-v4-transport",
+      "label": "V4 主题与帧",
+      "kind": "implementation",
+      "path": "packages/shared/src/zcode-protocol-v4/transport.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/shared/src/zcode-protocol-v4/transport.ts",
+      "supports": "三个主题 topic（conversation/sessions-index/workspace-config，:86-240）、TopicFrame= snapshot+delta（:164-166）、>1MiB 分片+crc32 的物理帧（wire.ts:15-49）、订阅走同管道 owned notification v4/conversation/frame（:382-411）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-inbox",
+      "label": "CommandInbox 串行 admission",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/command-inbox.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/command-inbox.ts",
+      "supports": "三层事实分离（in-flight/live pinned、settled 进 512 条 LRU）、AsyncGateRegistry FIFO + 固定锁序串行 admission（:79-141）、admissionSeq 分配权威、重复命令共享 final promise 且 duplicate ACK 不覆盖 failed 终态（:196-199, :446-449）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-rpc-layers",
+      "label": "Channel RPC 七层架构注释",
+      "kind": "docs",
+      "path": "packages/rpc/src/index.ts",
+      "lines": [
+        4,
+        28
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/rpc/src/index.ts#L4-L28",
+      "excerpt": " * 架构总览（从底到顶）：\n *\n * ┌──────────────────────────────────────────────────────────────┐\n * │  Layer 6: Remote 远程连接                                     │\n * │  RemoteAuthorityResolver → SocketFactory → PersistentProtocol │\n * │  → IPCClient → channel.call()                                │\n * ├──────────────────────────────────────────────────────────────┤\n * │  Layer 5: ProxyChannel 服务自动代理                            │\n * │  fromService(service) ↔ toService(channel)                   │\n * ├──────────────────────────────────────────────────────────────┤\n * │  Layer 4: IPCServer(1:N) / IPCClient(1:1 双向)               │\n * │  连接管理、路由、多播                                          │\n * ├──────────────────────────────────────────────────────────────┤\n * │  Layer 3: ChannelServer / ChannelClient                      │\n * │  基于 Channel 的 RPC (call/listen)                            │\n * ├──────────────────────────────────────────────────────────────┤\n * │  Layer 2: IMessagePassingProtocol                            │\n * │  send(buffer) / onMessage: Event<buffer>                     │\n * ├──────────────────────────────────────────────────────────────┤\n * │  Layer 1: 序列化 (VQL + 类型标签)                             │\n * │  serialize() / deserialize()                                  │\n * ├──────────────────────────────────────────────────────────────┤\n * │  Layer 0: 基础设施                                            │\n * │  Event / Emitter / Disposable / VSBuffer / CancellationToken │\n * └──────────────────────────────────────────────────────────────┘",
+      "supports": "客户端侧 RPC 框架的分层总览（源码自述）：序列化、传输抽象、Channel call/listen、连接管理、ProxyChannel 自动代理、远程连接——与 Agent 子进程侧的 NDJSON 协议是两套独立协议。"
+    },
+    {
+      "id": "ev-host-diagram",
+      "label": "窗口 Host 拓扑注释",
+      "kind": "docs",
+      "path": "packages/desktop/src/host/index.ts",
+      "lines": [
+        3,
+        14
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/desktop/src/host/index.ts#L3-L14",
+      "excerpt": "/**\n * Host Process 入口 —— 每个窗口对应一个独立的 host process\n *\n * 同一窗口的 Renderer 和手机 都 attachment 到这个 Host：\n *   Renderer / Mobile ←MessagePort→ Window Host\n *                                      ├─ local services\n *                                      └─ remote connection registry\n *\n * 启动流程：\n * 1. main 进程通过 Electron `utilityProcess.fork()` 创建本进程\n * 2. main 进程只发送一次 init-local 初始化窗口 Host\n * 3. 后续远端 connect / scoped attachment 都由同一 Host 处理",
+      "supports": "桌面进程拓扑的权威自述：每窗口一个 Host（UtilityProcess），Renderer 与手机都 attachment 到它，Host 内是本地服务+远程连接注册表；Main 只负责 fork 与一次性初始化。"
+    },
+    {
+      "id": "ev-spawn",
+      "label": "Agent 子进程 spawn",
+      "kind": "implementation",
+      "path": "packages/services/src/zcode-agent/zcodeAgentProcessManager.ts",
+      "lines": [
+        1019,
+        1034
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/services/src/zcode-agent/zcodeAgentProcessManager.ts#L1019-L1034",
+      "excerpt": "    const child = spawn(effectiveCommand.command, spawnPreflight.args, {\n      cwd: spawnPreflight.cwd,\n      // agent 可能再派生实际 runtime/MCP 子进程。POSIX 下让 wrapper 进入独立进程组，\n      // 关闭时才能按进程树整体回收；Windows 保持非 detached，交给 taskkill /T 处理。\n      detached: shouldSpawnInDetachedProcessGroup(),\n      env: {\n        ...sanitizeZCodeRuntimeEnv(process.env),\n        [ZCODE_RUNTIME_ENV_KEY]: runtimeEnv,\n        ...spawnEnv,\n        ...effectiveCommand.env,\n        // 身份/隔离语义使用 workspaceIdentity；cwd 继续使用 workspacePath。\n        ...buildAgentWorkspaceIdentityEnv(params.workspaceIdentity),\n        ...buildE2EAgentCoverageEnv(),\n      },\n      stdio: [\"pipe\", \"pipe\", \"pipe\"],\n    });",
+      "supports": "Agent CLI 子进程的 spawn 事实：stdio 三管道（协议帧/控制/stderr）、POSIX detached 进程组便于整树回收、环境清洗、workspaceIdentity 身份与 workspacePath 分离。"
+    },
+    {
+      "id": "ev-server-ws",
+      "label": "server 路由与鉴权",
+      "kind": "implementation",
+      "path": "packages/server/src/http.ts",
+      "lines": [
+        304,
+        329
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/server/src/http.ts#L304-L329",
+      "excerpt": "  const authToken = options.authToken?.trim();\n  if (authToken) {\n    app.use(\"*\", async (c, next) => {\n      const pathname = new URL(c.req.url).pathname;\n      const validToken = hasValidLiteToken(c, authToken);\n      if (!isTokenProtectedPath(pathname) || validToken) {\n        await next();\n        return;\n      }\n      return c.json({ error: \"Unauthorized\" }, 401);\n    });\n  }\n\n  app.get(\"/api/server-info\", (c) => c.json(createServerInfo(options)));\n  app.post(\"/api/rpc-host-capability\", (c) => c.json(hostCapabilities.issue()));\n\n  // 普通 `/ws` 永远是 terminal-client；浏览器/任意客户端设置旧 mode header\n  // 都不能再把自己提升为 trusted host。\n  app.get(\n    \"/ws\",\n    upgradeWebSocket(() => ({\n      onOpen(_event, ws) {\n        setupChannelServer(ws.raw as WebSocket, services, \"web-remote-replayable\");\n      },\n    })),\n  );",
+      "supports": "Web 形态的服务器事实：token 中间件只保护 /ws 与 /api/*；/api/rpc-host-capability 签发一次性 capability；/ws 永远按 web-remote-replayable 建连，浏览器不能伪装 trusted host。"
+    },
+    {
+      "id": "ev-server-cli",
+      "label": "守护进程化 server",
+      "kind": "implementation",
+      "path": "packages/zcode-server-cli/src/server-core/http.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/zcode-server-cli/src/server-core/http.ts",
+      "supports": "Core 形态复用同一路由结构但强制 loopback（非 loopback 直接抛错 fail-closed，:126-132）；Supervisor 有崩溃预算退避与 control socket。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-remote",
+      "label": "远程连接流程",
+      "kind": "implementation",
+      "path": "packages/server/src/remote/connect.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/server/src/remote/connect.ts",
+      "supports": "远程 workspace 连接五步：detect 校验支持矩阵（:172）→ deployServer 上传组件（deploy.ts:89）→ exec 启动远端 entry-stdio（:359-392）→ hello 握手逐行读 stdout（handshake.ts:20-126）→ ChannelClient（:217-220）；浏览器经 /ws/remote/:id 只桥接 file/git/system/terminal 四服务（http.ts:387-391）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-model-provider",
+      "label": "openai-compatible 工厂装配",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/adapters/src/model/model-execution.ts",
+      "lines": [
+        302,
+        316
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/adapters/src/model/model-execution.ts#L302-L316",
+      "excerpt": "      case \"openai-compatible\": {\n        const provider = createOpenAICompatible<string, string, string, string>({\n          name: providerConfig.name ?? providerId,\n          baseURL: providerConfig.baseURL,\n          apiKey,\n          fetch: optionFetch,\n          headers,\n          // OpenAI Compatible 流式 usage 需要显式请求，Usage 是执行结果的一部分。\n          includeUsage: true,\n          // 缺少这一装配时 SDK 默认 false，会把已声明支持的 Schema 静默降为 JSON object。\n          // 使用 binding 冻结的模型事实，不按供应商或实时 Registry 另查一套能力。\n          supportsStructuredOutputs: supportsJsonSchemaOutput,\n        });\n        return provider as LanguageModelFactory;\n      }",
+      "supports": "API 类型到 AI SDK 工厂的映射与两处能力装配注释：includeUsage 显式请求流式 usage；supportsStructuredOutputs 用 binding 冻结的模型事实而非实时查表。"
+    },
+    {
+      "id": "ev-provider-transport",
+      "label": "fetch 洋葱的传输层",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/adapters/src/model/model-execution.ts",
+      "lines": [
+        329,
+        338
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/adapters/src/model/model-execution.ts#L329-L338",
+      "excerpt": "    // 官方 Coding Plan 端点先替换为平台网关端点，再进入用户 HTTP 代理 fetch，\n    // httpProxy / noProxy 按实际发送地址判定。\n    const transport = createProviderTransportFetch({\n      caCertFile: this.network.caCertFile,\n      env: this.env,\n      fetch: this.baseTransport,\n      httpProxy: this.network.httpProxy,\n      noProxy: this.network.noProxy,\n    });\n    this.providerTransports.set(providerId, transport);",
+      "supports": "请求发出的最后一段：Coding Plan 网关改写先于代理 fetch，httpProxy/noProxy/caCert 按实际发送地址生效；transport 按 provider 缓存。"
+    },
+    {
+      "id": "ev-option-map",
+      "label": "Option Map fail-closed 注释",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/adapters/src/model/model-option-map-fetch.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/adapters/src/model/model-option-map-fetch.ts",
+      "supports": "自定义 fetch 在发出前用编译好的 Merge Patch 改写 JSON body；注释明言 Option Map 是 reasoning/max-output 的唯一请求字段权威，非文本 Body 必须 fail-closed（:15-48）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-plugin-manifest",
+      "label": "插件 manifest 结构",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/contracts/src/plugins/index.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/contracts/src/plugins/index.ts",
+      "supports": "PluginManifest 字段（:141-161）与官方市场 id（:7）；发现层四类候选来源、id=<name>@<marketplace>（adapters/plugins/index.ts:921）、suppressedBuiltins 抑制过滤（:155-161）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-plugin-seed",
+      "label": "内置插件播种",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/bootstrap/src/app/bundled-plugins.ts",
+      "lines": [
+        98,
+        108
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/bootstrap/src/app/bundled-plugins.ts#L98-L108",
+      "excerpt": "  // Catalog/cache 是内置插件的不可变产品资产；Runtime 是否加载由 discovery 的抑制态决定，\n  // 不能在 seed 阶段删除或过滤，否则卸载后详情页无法读取组件，也无法恢复。\n  writeOfficialMarketplace(input.storageRoot, source);\n  const retryBudget = createOfficialPluginCacheRetryBudget();\n  // 等锁超时降级后循环会继续；若每个插件独立重置 15s 等待预算，成组遗留的\n  // 锁会让启动同步冻结 N×15s。全部插件共享同一截止时间：无争用的锁仍瞬时获取（mkdir\n  // 一次成功不查预算），预算耗尽后有争用的锁立即降级，seeding 总等待封顶 15s。\n  const seedLockDeadlineAt = Date.now() + SEED_LOCK_TOTAL_BUDGET_MS;\n  const failedSeeds: OfficialPluginDefinition[] = [];\n  for (const plugin of source.plugins) {\n    const pluginId = `${plugin.definition.name}@${OFFICIAL_PLUGIN_MARKETPLACE}`;",
+      "supports": "内置插件播种的两条设计约束（源码注释自述）：缓存是不可变产品资产、卸载态由发现层抑制而非删除；全部插件共享 15 秒锁预算防止启动冻结。"
+    },
+    {
+      "id": "ev-bash-timeout",
+      "label": "Bash 超时策略",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/tool/bash-timeout-policy.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/tool/bash-timeout-policy.ts",
+      "supports": "默认 120s、上限 600s，BASH_DEFAULT_TIMEOUT_MS/BASH_MAX_TIMEOUT_MS 可覆盖；resolveBashTimeoutMs = min(input || default, max)（:6-35）。executor ToolDeadline 与 adapter 300s 默认构成三层。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-archcheck",
+      "label": "架构检查规则",
+      "kind": "implementation",
+      "path": "scripts/architecture/index.mjs",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/scripts/architecture/index.mjs",
+      "supports": "九类检查：forbidCycles(:36-71)、maxFileLines 400/契约 300(:135-156)、contract 公开方法 ≤12(:171-184)、layer-direction(:206-225)、domain-io(:188-201)、missing-module-artifact(:113-127)、deep-import(:252-266)、ui-implementation-import(:226-236)、baseline 指纹豁免(:282-306)。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-tui-renderer",
+      "label": "OpenTUI 渲染器配置",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/tui/src/tui.tsx",
+      "lines": [
+        23,
+        51
+      ],
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/tui/src/tui.tsx#L23-L51",
+      "excerpt": "  const renderer = await createCliRenderer({\n    backgroundColor: activeTuiTheme(startupThemeMode).background,\n    autoFocus: false,\n    consoleMode: \"disabled\",\n    enableMouseMovement: true,\n    exitOnCtrlC: false,\n    // Session replacement can raise SIGPIPE while closing MCP pipes. OpenTUI's\n    // default exit signals include it and would destroy the entire TUI.\n    exitSignals: [\"SIGINT\", \"SIGTERM\", \"SIGQUIT\", \"SIGABRT\", \"SIGHUP\", \"SIGBREAK\", \"SIGBUS\"],\n    consoleOptions: {\n      keyBindings: [\n        {\n          action: \"copy-selection\",\n          ctrl: true,\n          name: \"y\",\n        },\n      ],\n      onCopySelection: (text) => {\n        if (!hasCopyableSelectionText(text) || !options.writeClipboardText) return;\n        void Promise.resolve(options.writeClipboardText(text)).finally(() =>\n          renderer.clearSelection(),\n        );\n      },\n    },\n    stdin: options.stdin,\n    stdout: options.stdout,\n    targetFps: 30,\n    useMouse: true,\n  });",
+      "supports": "TUI 技术栈事实：OpenTUI createCliRenderer、30fps 帧循环、鼠标支持、禁用默认 Ctrl-C 退出并显式管理退出信号（SIGPIPE 会话替换保护）、剪贴板选择复制。技术栈为 React 19 + @mbears/opentui（非 Ink）。"
+    },
+    {
+      "id": "ev-tui-events",
+      "label": "TUI 事件 reducer 与去重",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/tui/src/app-session-event-handler.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/tui/src/app-session-event-handler.ts",
+      "supports": "常驻订阅与 per-turn 投递由 2048 条 id 记忆窗去重（:19-72），子会话事件按主会话闸门过滤；TUI 状态全是 useState 镜像（app.tsx:60-98），mode 切换乐观更新失败回滚（app-mode.ts:41-55）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-projection",
+      "label": "V4 投影存储规则",
+      "kind": "implementation",
+      "path": "packages/ui/src/v4/conversationProjectionStore.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/ui/src/v4/conversationProjectionStore.ts",
+      "supports": "只读投影、唯一写入方是订阅推送：snapshot 整体替换、delta 仅在 fromSeq 衔接时应用、断档携水位重订阅（重试 250ms/1s/3s，:1-6, :23-27）；行模型见 shared/src/zcode-protocol-v4/rows.ts（userInput/assistantText/reasoning/toolCall 等行）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-interactions",
+      "label": "交互弹窗统一收口",
+      "kind": "implementation",
+      "path": "packages/ui/src/v4/V4InteractionDialogs.tsx",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/ui/src/v4/V4InteractionDialogs.tsx",
+      "supports": "pendingInteractions 三类（permission/userInput/workspaceHookReview）分别接 PermissionDialog/ElicitationDialog/Hook 信任流；应答统一发 v4 resolveInteraction 命令并等 ACK（:78-80, :104-111, :175-213, :310-388）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-i18n",
+      "label": "i18n 与主题实现",
+      "kind": "implementation",
+      "path": "packages/ui/src/i18n/IntlProvider.tsx",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/packages/ui/src/i18n/IntlProvider.tsx",
+      "supports": "自研轻量 IntlProvider：静态字典+占位符替换、zh-CN/en-US 双语、locale 三层同步（localStorage/settingService/broadcast）；text-ui-* 刻度为 styles.css @theme 中派生自 --ui-font-size 的 calc() 变量（styles.css:143-151）。结论来自子代理逐行阅读。"
+    },
+    {
+      "id": "ev-turn-stop",
+      "label": "回合结束条件",
+      "kind": "implementation",
+      "path": "apps/zcode-cli/packages/core/src/runtime/methods/turn-stop.ts",
+      "url": "https://github.com/JS-banana/ZCode/blob/872ad960de7ec172591f7e1952f7849229f94521/apps/zcode-cli/packages/core/src/runtime/methods/turn-stop.ts",
+      "supports": "finishModelStepWithoutToolCalls（:157-237）：先尝试 inline guide 续跑一次（:195-200），再给 Stop 钩子一次续跑机会（:201-217），否则 turnMachine.complete + break；取消改发 TurnComplete(cancelled) 而非 TurnError（appendTurnOutcomeEvent，注释 :139-142）。结论来自子代理逐行阅读。"
+    }
+  ],
+  "next": [
+    "运行时验证：按 README 用 pnpm bootstrap 后跑 `pnpm dev:web`，抓取 /ws 上的 Channel RPC 帧与 Agent 子进程的 stdio NDJSON 帧，验证本研读的静态协议结论（delivery profile 节流、CommandInbox 串行、流式事件持久化）。",
+    "深读 packages/ui/src/v4/ 的时间线虚拟化、live tail 与乐观 overlay 的完整实现（SessionPane.tsx 约 4700 行，本次只确认了入口与投影规则）。",
+    "追 session-fork（core/src/runtime/methods/session-fork.ts，1487 行）与 steering 的完整语义：fork 后的投影 lineage、stale run 防护、owner/lease 路由。",
+    "细读 SQLite migrations 与 eventReducer 的归约规则，补全会话持久化机制的 schema 级证据。",
+    "OpenTUI（@mbears/opentui-core）与 Vercel AI SDK 的内部机制在预编译依赖中，本研读只确认了集成面；如需渲染差量与流解析细节需另读上游源码。"
+  ],
+  "frontmatter": {
+    "type": "study",
+    "title": "ZCode 全景研读：Electron、Web 与终端 Agent 的一体化装配",
+    "updated": "2026-09-21",
+    "status": "verified",
+    "tags": [
+      "agent",
+      "electron",
+      "rpc",
+      "protocol",
+      "typescript",
+      "llm",
+      "monorepo",
+      "tui"
+    ],
+    "sources": [
+      "https://github.com/JS-banana/ZCode"
+    ],
+    "watch": [
+      "ZCode/apps/zcode-cli/packages/core/src",
+      "ZCode/apps/zcode-cli/packages/bootstrap/src",
+      "ZCode/packages/services/src/zcode-agent",
+      "ZCode/packages/shared/src/zcode-protocol-v4",
+      "ZCode/packages/desktop/src/host"
+    ]
+  }
+}
