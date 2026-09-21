@@ -23,6 +23,22 @@
   --warm-soft: #f5ede6;
   --code: #20263a;
   --code-ink: #f3f4fa;
+  /* Syntax tokens. Five chromatic families — keyword, literal, string, call,
+     type — on a lightness ladder, so the classes stay distinguishable under
+     red-green colour blindness (a rose keyword and an amber literal would
+     otherwise both collapse to yellow). Comments, operators and punctuation
+     stay neutral; property and variable names keep the default ink, because
+     they make up most of the text and highlighting everything would highlight
+     nothing. Every value clears 4.5:1 on the code surface; the semantic ones
+     clear 6.5:1. Keep the print palette in source-reading.css in step. */
+  --code-tok-comment: #8499a8;
+  --code-tok-keyword: #fe8798;
+  --code-tok-constant: #f9c278;
+  --code-tok-string: #93cf9e;
+  --code-tok-function: #32c1f0;
+  --code-tok-entity: #afbaff;
+  --code-tok-operator: #b6c9d8;
+  --code-tok-punctuation: #9baebc;
   --focus: #ad7229;
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   font-size: 16px;
@@ -519,23 +535,26 @@ html:not(.enhanced) .chapter-actions, html:not(.enhanced) .copy-source, html:not
   .architecture .path-order, .map-path-control, .map-path-description { display: none !important; }
 }
 
-/* Source reading is layered on top of reader.css.  Keep the palette quiet so
-   highlighted syntax supports the explanation instead of competing with it. */
+/* Source reading is layered on top of reader.css.  Token colours come from the
+   --code-tok-* variables there. Five chromatic families carry the meaning —
+   keyword, literal, string, call, type — while comments, operators and
+   punctuation stay neutral. */
 
 .evidence code .token { color: inherit; }
-.evidence code .token.comment { color: #8f9aae; font-style: italic; }
-.evidence code .token.keyword { color: #c9b8e5; }
-.evidence code .token.string { color: #b8d6c2; }
-.evidence code .token.number { color: #d7c291; }
+.evidence code .token.comment { color: var(--code-tok-comment); font-style: italic; }
+.evidence code .token.keyword { color: var(--code-tok-keyword); }
+.evidence code .token.string { color: var(--code-tok-string); }
+.evidence code .token.number,
 .evidence code .token.boolean,
-.evidence code .token.null { color: #d2c18e; }
-.evidence code .token.function { color: #a8c9df; }
+.evidence code .token.null { color: var(--code-tok-constant); }
+.evidence code .token.function { color: var(--code-tok-function); }
 .evidence code .token.builtin,
-.evidence code .token.class-name { color: #c4cadb; }
-.evidence code .token.property { color: #c7c0e3; }
-.evidence code .token.variable { color: #d2d8e3; }
-.evidence code .token.operator { color: #c3cad6; }
-.evidence code .token.punctuation { color: #aeb8c8; }
+.evidence code .token.class-name { color: var(--code-tok-entity); }
+.evidence code .token.operator { color: var(--code-tok-operator); }
+.evidence code .token.punctuation { color: var(--code-tok-punctuation); }
+/* .token.property and .token.variable deliberately keep the default ink: they
+   are most of the characters, so colouring them would flatten the contrast the
+   five semantic families depend on. */
 
 .source-reading-goal {
   max-width: 92ch;
@@ -632,24 +651,20 @@ html:not(.enhanced) .chapter-actions, html:not(.enhanced) .copy-source, html:not
   }
   .source-annotation-text { display: block !important; color: #444; }
   .code-line.is-annotated { background: #eef0f5; box-shadow: inset 3px 0 #667; }
-  .evidence code .token.comment { color: #687080; }
-  .evidence code .token.keyword { color: #56426f; }
-  .evidence code .token.string { color: #356248; }
-  .evidence code .token.property { color: #584c76; }
+  /* Print is a light surface, so the tokens invert. Same five hue families as
+     screen, darkened to clear 4.5:1 on the printed code background.
+     property/variable keep the default ink here too, via the rule above. */
+  .evidence code .token.comment { color: #5a6772; }
+  .evidence code .token.keyword { color: #b92b48; }
+  .evidence code .token.string { color: #20713b; }
   .evidence code .token.number,
   .evidence code .token.boolean,
-  .evidence code .token.null { color: #72550e; }
-  .evidence code .token.function,
+  .evidence code .token.null { color: #965a03; }
+  .evidence code .token.function { color: #007095; }
   .evidence code .token.builtin,
-  .evidence code .token.class-name { color: #315c7b; }
-  .evidence code .token.variable,
-  .evidence code .token.operator,
-  .evidence code .token.punctuation { color: #4f5968; }
-}
-
-@media print {
-  .evidence code .token.property, .evidence code .token.variable,
-  .evidence code .token.operator, .evidence code .token.punctuation { color: #445064; }
+  .evidence code .token.class-name { color: #515ab6; }
+  .evidence code .token.operator { color: #5b6d7a; }
+  .evidence code .token.punctuation { color: #5c6a74; }
 }
 
 /* Search navigation leaves a visible target after the result dialog closes. */
